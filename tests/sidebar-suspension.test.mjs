@@ -197,7 +197,7 @@ test("the narrow sidebar drops a stale waking report too", () => {
 test("a waking row re-renders by itself when its 30 s end, with a one-shot sleep and no new timer", async () => {
   const { sleeps, timers, notified } = render(standin("working"), wokenCore(["pi", "", ""], NOW - 10_000));
   assert.deepEqual(sleeps.map(({ ms }) => ms), [20_000]);
-  assert.deepEqual(timers, [3000, 10000, 15000]);
+  assert.deepEqual(timers, [15000]);
   await new Promise((resolve) => setImmediate(resolve)); // the render's other tasks
   const before = notified();
   sleeps[0].resolve();
@@ -229,8 +229,8 @@ test("a live agent with a leftover label never shows 💤, also before it report
   assert.equal(colorOf(r, "Fix the parser"), "FG");
 });
 
-// The 3 s labeling timer (remember()): the last-agent label says which agent
-// ↻ starts again.
+// The last-agent labeling (remember(), run from render): the label says which
+// agent ↻ starts again. No timer: a new agent or program re-renders the mod.
 async function labelPass(p, labels) {
   world.panes = [p];
   world.terminals = [{ address: "t7", state: "live", labels }];
@@ -239,7 +239,8 @@ async function labelPass(p, labels) {
   const cx = { notify() {}, timer: { every: (ms, run) => handlers.push({ ms, run }), after() {} }, spawn: (run) => { run(cx); } };
   const view = new TabTree();
   view.init({}, { ...cx, spawn() {} });
-  handlers.find(({ ms }) => ms === 3000).run(cx);
+  assert.deepEqual(handlers.map(({ ms }) => ms), [15000], "no labeling timer");
+  view.remember(cx);
   await new Promise((resolve) => setImmediate(resolve));
   return world.hc.filter(([command]) => command === "label");
 }

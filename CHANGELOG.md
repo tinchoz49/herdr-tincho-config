@@ -10,6 +10,21 @@ consolidated below.
 
 ### Added
 
+- Resume report: every agent's own plugin writes one label, `herdr.resume`,
+  with the command that continues its conversation, its folder and a proof
+  file. ↻ recovery, the suspension rules and the stand-in read only that
+  report and check the proof before they act; ↻ falls back to the agent's
+  session picker. Pi's extension writes it in place of `herdr.pi-recovery`.
+  A new Claude Code plugin, `herdr-resume`, writes Claude's from its
+  `SessionStart` and `Stop` hooks through `herdr-agent-report`, so a
+  `/clear` or `/resume` is reported at once and without the Herdr app open.
+  The old labels are still read while a terminal has no report, for one
+  release.
+- The installer builds and installs `herdr-agent-report` next to the stand-in
+  (rebuilt when its sources change), and installs the Claude plugin from the
+  repo's marketplace when `claude` is on `PATH`; without it, it prints the
+  commands to run by hand.
+
 - Personal `tincho` layout with a grouped tab and pane sidebar, tighter terminal
   padding, and Catppuccin Latte and Frappé themes.
 - Sidebar session titles, agent status indicators, and drag-and-drop ordering
@@ -62,8 +77,8 @@ consolidated below.
   Stale suspension labels are removed on their own. A woken agent that never
   reports its status is reported `idle` once by a watchdog after 30 s, so hc
   and `hc wait` don't treat it as busy for good.
-- Claude launch options recorded in `herdr.claude-options` through an
-  allow-list, and replayed by recovery and waking.
+- Claude launch options kept through an allow-list, and replayed by recovery
+  and waking.
 - Installer builds the stand-in with Bun (ahead-of-time compile, else the
   standard compile, skipped without Bun), installs it with `herdr-shell`
   outside `PATH`, and sets herdr-core's `shell` key, reporting a different
@@ -137,6 +152,10 @@ consolidated below.
 
 ### Removed
 
+- The mod's 10 s Claude polling: it no longer reads
+  `~/.claude/sessions/<pid>.json` or writes `herdr.claude-session` and
+  `herdr.claude-options`; the Claude plugin's report replaces them, and the
+  reporter clears both labels.
 - Tracking and installation of Herdr's machine-managed `settings.json`.
   Machine-specific settings remain outside this repository.
 - Experimental sideways-swipe sidebar resizing, which interfered with list

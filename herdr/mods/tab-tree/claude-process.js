@@ -1,3 +1,7 @@
+// Whether a terminal runs Claude, from what the core says of its process: the
+// app it reports (OSC 7501), its program key, or its argv. The suspension rules
+// use it to name the agent in front (suspend-policy.js).
+
 const claude = (name) => /^(claude|claude-code)$/i.test(name);
 const base = (path) => typeof path === "string" ? path.split(/[\\/]/).pop().replace(/^-/, "").replace(/\.exe$/i, "") : "";
 
@@ -39,22 +43,4 @@ export function isClaude(t) {
   if (key === "claude") return true;
   if (t?.program?.shell || (key && !["agent", "program", "node", "bun"].includes(key))) return false;
   return claudeWords(frontArgv(t)) !== null;
-}
-
-// The words after the program name of the Claude process in front, or [] when
-// its argv is not a recognized Claude launch.
-/** @returns {unknown[]} */
-export function claudeLaunchWords(t) {
-  return claudeWords(frontArgv(t)) ?? [];
-}
-
-export function claudeCandidate(t) {
-  return Boolean(t?.address && !t.address.includes("/") && t.state === "live" && isClaude(t));
-}
-
-// Ignore status/turn/title/labels: they can change without replacing a process.
-// Capture a string before awaiting, rather than retaining a mutable host object.
-export function processIdentity(t) {
-  return JSON.stringify([t?.pid, t?.argv, t?.foreground?.pid, t?.foreground?.argv,
-    t?.report?.app ?? t?.status?.app]);
 }

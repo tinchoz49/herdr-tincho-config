@@ -36,13 +36,17 @@
 set -eu
 
 project=$(cd "$(dirname "$0")/.." && pwd)
-for tool in hc node bun fish pi; do
+for tool in hc node bun fish; do
   command -v "$tool" >/dev/null 2>&1 || { echo "suspend.integration: $tool is not on PATH" >&2; exit 1; }
 done
+# Without a real pi, the real Pi checks are skipped (and said so); the fake
+# agents still run.
+has_pi=false
+command -v pi >/dev/null 2>&1 && has_pi=true
 HC=$(command -v hc)
 NODE=$(command -v node)
 FISH=$(command -v fish)
-PI=$(command -v pi)
+PI=$(command -v pi || true)
 
 # Set once the disposable core answered from its socket under $work. Cleanup
 # stops a core only when that same core still answers: if hc ever ignored
@@ -254,17 +258,21 @@ run_agent=$(start --name hsi-run --parent "$parent" --cwd "$wd_run" \
   --label herdr.last-agent=pi --label "herdr.pi-recovery=$pi_recovery" -- pi --model fake-model)
 wait_until 10 "the hc run agent to report idle" 'reports "$run_agent" pi idle'
 
-# The fish-hosted agent: Claude with its session and launch options, typed
-# into the shell that hc started (herdr-shell, no label, so fish).
+# The fish-hosted agent: Claude with the resume report its plugin writes
+# (herdr.resume), typed into the shell that hc started (herdr-shell, no
+# label, so fish). The hc run Pi above keeps the old herdr.pi-recovery label,
+# so the wakes cover both the report and the legacy adapter.
 wd_fish="$work/wd-fish"
 mkdir -p "$wd_fish"
 claude_session=4f0c2a9e-7d1b-4c8e-a3f5-6b2e9d0c1a7f
 # Its transcript: the stand-in wakes Claude only when it exists.
 mkdir -p "$HOME/.claude/projects/-hsi-wd-fish"
-printf '{"type":"user","sessionId":"%s"}\n' "$claude_session" > "$HOME/.claude/projects/-hsi-wd-fish/$claude_session.jsonl"
+claude_proof="$HOME/.claude/projects/-hsi-wd-fish/$claude_session.jsonl"
+printf '{"type":"user","sessionId":"%s"}\n' "$claude_session" > "$claude_proof"
+claude_report=$(printf '{"version":1,"agent":"claude","session":"%s","argv":["claude","--model","haiku","--resume","%s"],"cwd":"%s","proof":"%s","pid":1,"at":1}' \
+  "$claude_session" "$claude_session" "$wd_fish" "$claude_proof")
 fish_agent=$(start --name hsi-fish --parent "$parent" --cwd "$wd_fish" \
-  --label herdr.last-agent=claude --label "herdr.claude-session=$claude_session" \
-  --label 'herdr.claude-options={"version":1,"options":["--model","haiku"]}')
+  --label herdr.last-agent=claude --label "herdr.resume=$claude_report")
 wait_until 10 "fish in the shell terminal" '[ "$(field "$fish_agent" "t.foreground?.name")" = fish ]'
 check "herdr-shell started \$SHELL in a terminal without the label" [ "$(field "$fish_agent" 't.argv?.[0]')" = "$suspend_bin/herdr-shell" ]
 # The full path, so even a fish that rebuilt its PATH cannot start a real claude.
@@ -418,6 +426,7 @@ real_pi() { # real_pi <name>: starts a real Pi and waits for its idle report and
   echo "$t"
 }
 
+if $has_pi; then
 echo "--- real pi, root=agent: SIGKILL"
 pi_kill=$(real_pi hsi-pi-kill)
 identity_before=$(identity "$pi_kill")
@@ -440,6 +449,9 @@ wait_until 15 "$pi_term to end or start a new program" \
 term_end=$(field "$pi_term" '`${t.state}, exit_code ${t.exit_code}, signal ${t.signal}`')
 check "$pi_term: SIGTERM to a real Pi as root=agent ends the kept terminal ($term_end)" \
   [ "$term_end" = "finished, exit_code 0, signal null" ]
+else
+echo "--- real pi: SKIPPED (pi is not on PATH)"
+fi
 
 # The woken agents reported, so the wake watchdogs must leave their reports alone.
 wait_watchdogs

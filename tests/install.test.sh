@@ -23,10 +23,11 @@ assert_file() { [ -f "$1" ] || fail "missing $1"; }
 assert_absent() { [ ! -e "$1" ] || fail "unexpected $1"; }
 assert_same() { cmp -s "$1" "$2" || fail "$1 differs from $2"; }
 assert_log() { grep -F -e "$1" "$log" >/dev/null || fail "missing log: $1"; }
-# The caller's PATH without folders that hold a bun, so a real Bun never
-# builds anything here. Tests that need Bun put a fake one first.
+# The caller's PATH without folders that hold a bun or a claude, so a real
+# Bun never builds anything here and the real Claude config is never touched.
+# Tests that need them put a fake one first.
 nobun_path=$(printf '%s\n' "$PATH" | tr ':' '\n' | while IFS= read -r dir; do
-  if [ -n "$dir" ] && [ ! -x "$dir/bun" ]; then printf '%s:' "$dir"; fi
+  if [ -n "$dir" ] && [ ! -x "$dir/bun" ] && [ ! -x "$dir/claude" ]; then printf '%s:' "$dir"; fi
 done)
 nobun_path=${nobun_path%:}
 hash() {
@@ -73,14 +74,19 @@ run() {
     XDG_STATE_HOME="$state" XDG_DATA_HOME="$data_override" HERDR_APP_HOME="$app_override" \
     PI_CODING_AGENT_DIR="$pi_override" sh "$repo/install.sh" "$@"
 }
-# Stand-in sources in the fixture repo: the real build script and launcher,
-# and small stand-ins for the TypeScript sources and the shared recipe module.
+# Stand-in and reporter sources in the fixture repo: the real build script
+# and launcher, and small stand-ins for the TypeScript sources and the shared
+# modules. claude-options.js is imported only through resume-report.js.
 suspend_sources() {
   mkdir -p "$repo/suspend" "$repo/herdr/mods/tab-tree"
   cp "$project/suspend/build.sh" "$project/suspend/herdr-shell" "$repo/suspend/"
   printf 'import "./standin";\n' > "$repo/suspend/main.ts"
   printf 'import { recipe } from "../herdr/mods/tab-tree/recipes.js";\nexport const standin = 1;\n' > "$repo/suspend/standin.ts"
   printf 'export const recipe = 1;\n' > "$repo/herdr/mods/tab-tree/recipes.js"
+  printf 'import "./report";\n' > "$repo/suspend/report-main.ts"
+  printf 'import { parseReport } from "../herdr/mods/tab-tree/resume-report.js";\n' > "$repo/suspend/report.ts"
+  printf 'import { claudeOptionsRecord } from "./claude-options.js";\nexport const parseReport = 1;\n' > "$repo/herdr/mods/tab-tree/resume-report.js"
+  printf 'export const claudeOptionsRecord = 1;\n' > "$repo/herdr/mods/tab-tree/claude-options.js"
 }
 # A fake bun first on PATH. $1: aot (has `bun compile`), standard (only
 # `bun build --compile`) or broken (every build fails). Each build writes a
@@ -104,7 +110,25 @@ EOF
   chmod +x "$case_dir/fake-bin/bun"
   run_path="$case_dir/fake-bin:$nobun_path"
 }
-build_count() { wc -l < "$builds" | tr -d ' '; }
+# Builds of the stand-in (one per pass that builds); report_count: of the reporter.
+build_count() { grep -c '/suspend/main\.ts$' "$builds" || :; }
+report_count() { grep -c '/suspend/report-main\.ts$' "$builds" || :; }
+# A fake claude first on PATH: it logs each call's arguments in $claude_calls,
+# and fails `plugin install` when $1 is broken.
+fake_claude() {
+  claude_calls="$case_dir/claude-calls"
+  mkdir -p "$case_dir/fake-claude"
+  : > "$claude_calls"
+  cat > "$case_dir/fake-claude/claude" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> '$claude_calls'
+[ '${1:-ok}' = broken ] && [ "\$2" = install ] && { echo 'error: fake install failure' >&2; exit 1; }
+exit 0
+EOF
+  chmod +x "$case_dir/fake-claude/claude"
+  run_path="$case_dir/fake-claude:$run_path"
+}
+claude_count() { wc -l < "$claude_calls" | tr -d ' '; }
 
 fixture no-pi
 rmdir "$home/.pi"
@@ -274,6 +298,10 @@ grep -F 'compile --trim-locales en --no-compile-function-source --outfile' "$bui
   fail "not the ahead-of-time compile: $(cat "$builds")"
 grep -F 'built by fake bun' "$bin/herdr-standin" >/dev/null || fail 'stand-in not installed'
 [ -x "$bin/herdr-standin" ] || fail 'stand-in not executable'
+[ "$(report_count)" = 1 ] || fail "expected one reporter build, got $(report_count)"
+grep -F 'built by fake bun' "$bin/herdr-agent-report" >/dev/null || fail 'reporter not installed'
+[ -x "$bin/herdr-agent-report" ] || fail 'reporter not executable'
+assert_log 'built      herdr-standin and herdr-agent-report (ahead-of-time compile)'
 assert_same "$repo/suspend/herdr-shell" "$bin/herdr-shell"
 [ -x "$bin/herdr-shell" ] || fail 'herdr-shell not executable'
 [ -z "$(find "$bin" -name '*.install-tmp' -print)" ] || fail 'staging files remain'
@@ -282,7 +310,7 @@ assert_file "$app/mods/example/main.js"
 [ -z "$(cd "$home" && find . -name '.*rc' -o -name '.*profile' -o -name config.fish)" ] ||
   fail 'a shell startup file was written'
 if grep -F 'PATH' "$log" >/dev/null; then fail 'install talks about PATH'; fi
-echo 'ok - the ahead-of-time compile installs the stand-in and herdr-shell outside PATH'
+echo 'ok - the ahead-of-time compile installs the stand-in, the reporter and herdr-shell outside PATH'
 
 fixture standin-standard
 suspend_sources
@@ -319,6 +347,8 @@ cp "$bin/herdr-standin" "$case_dir/first-build"
 entry=$(awk '$2 == "herdr-standin" { print $1 }' "$record/installed-suspend")
 [ -n "$entry" ] || fail 'no manifest entry for herdr-standin'
 [ "$entry" != "$(hash "$bin/herdr-standin")" ] || fail 'herdr-standin keyed by its output'
+grep -F "$entry herdr-agent-report" "$record/installed-suspend" >/dev/null ||
+  fail 'herdr-agent-report not recorded by the same source hash'
 grep -F "$(hash "$repo/suspend/herdr-shell") herdr-shell" "$record/installed-suspend" >/dev/null ||
   fail 'herdr-shell not recorded'
 run > "$log"
@@ -335,42 +365,58 @@ entry2=$(awk '$2 == "herdr-standin" { print $1 }' "$record/installed-suspend")
 printf 'import { recipe } from "../herdr/mods/tab-tree/recipes.js";\nexport const standin = 2;\n' > "$repo/suspend/standin.ts"
 run > "$log"
 [ "$(build_count)" = 3 ] || fail 'a stand-in source change did not rebuild the stand-in'
+[ "$(report_count)" = 3 ] || fail 'the reporter was not rebuilt with the stand-in'
+# The reporter's own sources rebuild both, also a file it imports only through
+# another shared module (claude-options.js through resume-report.js).
+printf 'export const claudeOptionsRecord = 2;\n' > "$repo/herdr/mods/tab-tree/claude-options.js"
+run > "$log"
+[ "$(report_count)" = 4 ] || fail 'an allowlist change did not rebuild the reporter'
+printf 'import "./report";\n// 2\n' > "$repo/suspend/report-main.ts"
+run > "$log"
+[ "$(report_count)" = 5 ] || fail 'a reporter source change did not rebuild the reporter'
+[ "$(build_count)" = 5 ] || fail 'the stand-in was not rebuilt with the reporter'
 # A test file and a Herdr file the stand-in does not import rebuild nothing.
 printf 'test\n' > "$repo/suspend/standin.test.ts"
 printf 'herdr-v2\n' > "$repo/herdr/mods/example/main.js"
 run > "$log"
-[ "$(build_count)" = 3 ] || fail 'a file outside the stand-in rebuilt it'
+[ "$(build_count)" = 5 ] || fail 'a file outside the stand-in rebuilt it'
 # A deleted binary is built again without a source change.
 rm "$bin/herdr-standin"
 run > "$log"
-[ "$(build_count)" = 4 ] || fail 'a missing stand-in was not rebuilt'
+[ "$(build_count)" = 6 ] || fail 'a missing stand-in was not rebuilt'
+rm "$bin/herdr-agent-report"
+run > "$log"
+[ "$(report_count)" = 7 ] || fail 'a missing reporter was not rebuilt'
 # A launcher change installs herdr-shell, and nothing is built.
 printf '# local\n' >> "$repo/suspend/herdr-shell"
 run > "$log"
-[ "$(build_count)" = 4 ] || fail 'a launcher change rebuilt the stand-in'
+[ "$(build_count)" = 7 ] || fail 'a launcher change rebuilt the stand-in'
 assert_same "$repo/suspend/herdr-shell" "$bin/herdr-shell"
-echo 'ok - the stand-in is keyed by its source hash and rebuilt only when its sources change'
+echo 'ok - the stand-in and the reporter are keyed by their source hash and rebuilt only when it changes'
 
 fixture standin-broken
 suspend_sources
 fake_bun aot
 run > "$log"
 cp "$bin/herdr-standin" "$case_dir/first-build"
+cp "$bin/herdr-agent-report" "$case_dir/first-report"
 cp "$record/installed-suspend" "$case_dir/suspend-record"
 printf 'export const standin = 2;\n' > "$repo/suspend/standin.ts"
 printf 'herdr-v2\n' > "$repo/herdr/mods/example/main.js"
 fake_bun broken
 run > "$log" 2>&1 || fail 'a failed build failed the install'
-assert_log 'building herdr-standin failed'
+assert_log 'building herdr-standin and herdr-agent-report failed'
 assert_log 'fake build failure'
 assert_same "$case_dir/first-build" "$bin/herdr-standin"
+assert_same "$case_dir/first-report" "$bin/herdr-agent-report"
 assert_same "$case_dir/suspend-record" "$record/installed-suspend"
 assert_same "$repo/herdr/mods/example/main.js" "$app/mods/example/main.js"
 [ -z "$(find "$bin" -name '*.install-tmp' -print)" ] || fail 'staging files remain'
 fake_bun aot
 run > "$log"
 [ "$(build_count)" = 1 ] || fail 'the next run did not retry the failed build'
-echo 'ok - a failed build keeps the installed stand-in and is retried on the next run'
+[ "$(report_count)" = 1 ] || fail 'the next run did not build the reporter'
+echo 'ok - a failed build keeps the installed binaries and is retried on the next run'
 
 fixture shell-key-missing
 suspend_sources
@@ -512,6 +558,61 @@ assert_same "$case_dir/expected" "$config/herdr-core/config.toml"
 assert_absent "$core"
 echo 'ok - the herdr-core config follows XDG_CONFIG_HOME'
 
+# The Claude plugin's marketplace in the fixture repo (claude/).
+claude_sources() {
+  mkdir -p "$repo/claude/.claude-plugin"
+  cp "$project/claude/.claude-plugin/marketplace.json" "$repo/claude/.claude-plugin/"
+}
+plugin=herdr-resume@herdr-tincho-config
+
+fixture claude-plugin
+claude_sources
+fake_claude
+run > "$log"
+printf 'plugin marketplace add %s\nplugin install %s --scope user\n' "$repo/claude" "$plugin" > "$case_dir/expected"
+assert_same "$case_dir/expected" "$claude_calls"
+assert_log "installed  Claude plugin $plugin"
+assert_file "$app/mods/example/main.js"
+# Recorded once per repo folder: a second run calls claude no more.
+run > "$log"
+[ "$(claude_count)" = 2 ] || fail "a second run called claude again: $(cat "$claude_calls")"
+if grep -F 'Claude plugin' "$log" >/dev/null; then fail 'a second run reported the plugin again'; fi
+# --force runs both commands again (both do nothing when it is installed).
+run --force > "$log"
+[ "$(claude_count)" = 4 ] || fail "--force did not reinstall the plugin: $(cat "$claude_calls")"
+# Another repo folder installs again.
+printf 'x %s\n' "$plugin" > "$record/installed-claude"
+run > "$log"
+[ "$(claude_count)" = 6 ] || fail 'a plugin from another folder was not reinstalled'
+echo 'ok - the Claude plugin is installed from the repo marketplace once per folder, again with --force'
+
+fixture claude-plugin-no-claude
+claude_sources
+run > "$log"
+assert_log 'claude: skipped (no claude on PATH)'
+assert_log "claude plugin install $plugin --scope user"
+assert_file "$app/mods/example/main.js"
+assert_file "$pi/extensions/herdr-recovery/index.ts"
+assert_absent "$record/installed-claude"
+assert_absent "$home/.claude"
+echo 'ok - without claude the plugin is skipped with the commands to run, and the rest installs'
+
+fixture claude-plugin-broken
+claude_sources
+suspend_sources
+fake_bun aot
+fake_claude broken
+run > "$log" 2>&1 || fail 'a failed plugin install failed the install'
+assert_log "installing the plugin $plugin failed"
+assert_log 'fake install failure'
+assert_absent "$record/installed-claude"
+assert_file "$app/mods/example/main.js"
+[ -x "$bin/herdr-agent-report" ] || fail 'the reporter was not installed'
+fake_claude
+run > "$log"
+assert_log "installed  Claude plugin $plugin"
+echo 'ok - a failed plugin install stops nothing else and is retried on the next run'
+
 # watch_until <what> <command...>: runs the command every 0.1 s until it
 # succeeds, for up to 10 s, and fails if the watcher exits meanwhile.
 watch_until() {
@@ -600,7 +701,7 @@ fixture watch-standin
 suspend_sources
 fake_bun aot
 start_watch "$run_path"
-wait_log 'suspend: 2 installed'
+wait_log 'suspend: 3 installed'
 wait_log 'set        shell'
 before=$(inode "$core")
 # Idle: the new binary and the manifest are not sources, so nothing rebuilds.

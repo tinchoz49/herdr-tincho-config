@@ -23,11 +23,13 @@ herdr/            mirrors the Herdr app home (~/.config/herdr-app)
                     tincho-files/, tincho-changes/ (personal panel copies)
   themes/           catppuccin-latte.json, catppuccin-frappe.json
 pi/              mirrors Pi's agent directory (~/.pi/agent)
-  extensions/       herdr-recovery/ (session metadata for the ↻ button)
-suspend/         the stand-in and herdr-shell (see Suspending unused agents)
+  extensions/       herdr-recovery/ (writes Pi's resume report)
+claude/          a Claude Code marketplace: herdr-resume/ (writes Claude's resume report)
+suspend/         the stand-in, herdr-shell and Claude's reporter
+                 (see Suspending unused agents, Resume report)
 tests/           recovery and isolated installer tests
 install.sh       copies herdr/ and pi/ into their respective homes,
-                 builds the stand-in
+                 builds the stand-in and the reporter, installs the Claude plugin
 ```
 
 `install.sh` puts every file under `herdr/` at the same path in the Herdr app
@@ -48,7 +50,9 @@ PI_CODING_AGENT_DIR="$HOME/custom-pi-agent" ./install.sh
 
 The recovery extension has no npm dependencies. When it is installed, run
 `/reload` in existing Pi sessions to load it; new Pi sessions discover it
-automatically. If you set up Pi later, rerun `./install.sh`.
+automatically. If you set up Pi later, rerun `./install.sh`. The Claude
+plugin is installed the same way when `claude` is on `PATH`
+([Install](#install)).
 
 - Copies, not symlinks: Herdr doesn't reload a mod through a symlink. Each
   file is written whole and renamed into place, since Herdr reads a file the
@@ -234,37 +238,23 @@ itself: every few seconds it labels each local terminal running an agent with
 `herdr.last-agent=<program key>` (`claude`, `pi`, `codex`, ...). The core keeps
 labels across restarts.
 
-Hover a tab back at a shell prompt for ↻. It types the resume command for the
-agent that terminal last ran, from `RECIPES` in `recipes.js`:
+Hover a tab back at a shell prompt for ↻. It reads the terminal's
+[resume report](#resume-report):
 
-- `claude`: `claude --resume <session id>`, the exact conversation that
-  terminal last ran. Every 10 seconds the mod reads each running Claude's id
-  from `~/.claude/sessions/<pid>.json` and labels its terminal
-  `herdr.claude-session=<id>`, so several agents in one folder each get their
-  own back. Without an id yet: `claude --resume '<tab name>'` in a named tab,
-  else `claude --resume` (the picker). Never `--continue`: it takes the
-  folder's latest conversation, often another tab's. Only positively identified
-  local, live Claude processes are probed; Pi, Codex, shells, remote and exited
-  terminals cause no session-probe commands. Current app/program metadata or
-  conservative command-position argv identifies Claude, never recovery labels.
-  Identity checks reject process changes during probes, and unchanged sessions
-  skip label writes. Claude stays polled so same-process `/clear` and `/resume`
-  changes are detected. Herdr has no atomic PID-conditional label operation,
-  so the final check-to-write race cannot be eliminated completely. The
-  line also carries Claude's launch options (see
-  [Claude launch options](#claude-launch-options)).
+- A report whose conversation is on disk: ↻ types
+  `cd '<cwd>' && '<argv[0]>' '<argv[1]>' ...`, every word quoted. That is the
+  exact conversation that terminal last ran, started with its launch options.
+- A report whose conversation is missing, or no report: ↻ opens the agent's
+  own session picker, never a new conversation and never `--continue` (it
+  takes the folder's latest conversation, often another tab's). Claude:
+  `claude --resume '<tab name>'` in a named tab, else `claude --resume`. Pi:
+  `pi --resume` with the report's launch options. With a report, both run in
+  its folder. Only Claude and Pi have a picker.
 
-  Recovery never types into a suspended agent's terminal: ↻ isn't shown there.
-- `pi`: `pi --session '<absolute session file>'` plus supported launch options.
-  The extension below records the exact conversation; an ID-only record uses
-  `pi --session '<id>'` from the recorded working directory. Missing/invalid
-  metadata or a missing, empty or mismatched session file opens `pi --resume`
-  (the picker), never `--continue`. With valid metadata, that fallback keeps the
-  recorded directory and launch options. Pi is sent once, after checking
-  the terminal is still at its shell; it does not use Claude's report timeout
-  and `/exit` retries, which could interrupt the picker.
-- `codex`: still commented out until its flags are checked. Recipes live in
-  `herdr/mods/tab-tree/recipes.js`.
+Pi is sent once, after checking the terminal is still at its shell; it does
+not use Claude's report timeout and `/exit` retries, which could interrupt the
+picker. Recovery never types into a suspended agent's terminal: ↻ isn't
+shown there.
 
 Recovery requests run serially within each sidebar copy. The queue belongs to
 the view instance—not module scope, which Herdr 0.1.14 shares across copies.
@@ -273,35 +263,65 @@ sidebar can recover independently even if an old native promise never settles.
 Already-issued commands cannot be recalled. Separate sidebar copies have
 independent queues. Hiding the sidebar does not close it or cancel recovery.
 
-No label, or no recipe for it: no button. A tab whose agent ran before this
-mod labelled it gets one after that agent runs there once. Remote machines get
-no button.
+No `herdr.last-agent` label and no report, or an agent without a picker: no
+button. Remote machines get no button.
 
-### Pi recovery metadata (`pi/extensions/herdr-recovery/`)
+### Resume report
 
-The extension identifies its terminal through `HC_TERMINAL_ID`. On
-`session_start` (startup, `/reload`, `/new`, `/resume`, and `/fork`), it saves
-`herdr.last-agent=pi` and one JSON label, `herdr.pi-recovery`, with `hc label`:
+Each agent says how to continue its own conversation. A plugin that runs
+inside the agent (Pi's extension, the Claude plugin) writes it on the
+agent's terminal, as one label, `herdr.resume`, with the same format for every
+agent:
 
 ```json
 {
   "version": 1,
-  "sessionId": "01a1b208-example",
-  "sessionFile": "/home/me/.pi/agent/sessions/.../session.jsonl",
+  "agent": "pi",
+  "session": "0193b6c2-example",
+  "argv": ["pi", "--session", "/home/me/.pi/agent/sessions/x.jsonl", "--model", "sonnet"],
   "cwd": "/home/me/project",
-  "args": ["--thinking", "high", "--tools", "read,bash"]
+  "proof": "/home/me/.pi/agent/sessions/x.jsonl",
+  "pid": 41230,
+  "at": 1795614571208
 }
 ```
 
-Herdr keeps this metadata across restarts, separately for each terminal. The
-conversation stays in Pi's own session file; the extension does not copy it.
-Before opening a saved file, the button reads at most 4096 bytes and checks
-that its first JSON line is a session header with the recorded ID. This avoids
-Pi silently creating a new conversation for an empty or missing file.
-It leaves the label on exit, clears it for ephemeral (`--no-session`) sessions,
-and retries failed writes at the next agent turn without polling. Print, JSON,
-and RPC runs do not change labels, so a nested Pi command cannot replace its
-interactive parent's metadata in those modes.
+- `agent`: the program key. `session`: the conversation id. `argv`: the whole
+  command that continues it, launch options included. `cwd`: the folder to
+  run it in. `proof`: the file that holds the conversation. `pid`: the agent
+  process that wrote it. `at`: when (ms).
+- An empty value means "nothing to resume": an ephemeral session, or a new
+  one before its first message.
+- **Proof rule:** a report counts only while its `proof` file exists and its
+  first 4 KB name the session. ↻, the suspension rules and the stand-in all
+  check it, the same way (`resume-report.js`). A missing proof is given as the
+  reason ("its conversation file … is missing").
+- The mod and the stand-in validate the whole report: a report that breaks a
+  rule counts as no report. They never run `argv` through a shell: the
+  stand-in starts it directly, ↻ quotes every word.
+- The plugins write `herdr.resume` and `herdr.last-agent` in one `hc label`
+  call. They write only inside hc (`HC_TERMINAL_ID`) and only for an
+  interactive session, so an agent that a tool starts never replaces its
+  parent's report. They keep the report when the agent exits: ↻ needs it then.
+- herdr-tincho-config holds no per-agent recipe: a new agent needs only a
+  plugin that writes this report.
+
+Before this report, Pi wrote `herdr.pi-recovery`, and the mod polled Claude
+every 10 s and wrote `herdr.claude-session` and `herdr.claude-options`. The
+mod still reads those old labels, only while a terminal has no
+`herdr.resume` label at all, so agents that were suspended or lost before the
+upgrade still wake and recover. The plugins clear them when they write a
+report. That reading goes one release later.
+
+#### Pi (`pi/extensions/herdr-recovery/`)
+
+The extension writes Pi's report on `session_start` (startup, `/reload`,
+`/new`, `/resume`, `/fork`), and again at each turn, so a new session gets its
+report once Pi writes its file and a failed write is retried without polling.
+It writes only in Pi's `tui` mode. Its `argv` is
+`pi --session <session file> <launch options>`, and its proof is the session
+file. It writes an empty report while the file doesn't exist (also for
+`--no-session`). A failed write shows one warning.
 
 Launch options come from Pi's `process.argv`, not Herdr's process inspection:
 Pi changes its process title, which can hide its arguments from the OS.
@@ -319,22 +339,60 @@ Pi changes its process title, which can hide its arguments from the OS.
   launch-time session name. `--api-key`, inline system prompts and trust
   approvals are not saved. Unknown flags (including extension-specific flags)
   stop option capture: their values cannot safely be distinguished from later
-  options. These omissions are silent; values are not logged. A warning is
-  shown only if saving the recovery metadata fails.
+  options.
 
 These are **launch options**, not a snapshot of all runtime settings. For
 example, a saved `--model` or `--thinking` overrides changes made later inside
 Pi. Shell wrappers, environment variables, credentials and Node runtime flags
-are not captured. Arguments are stored as an array and shell-quoted on replay
-for sh/bash/zsh/fish; control characters in recovery metadata are rejected.
+are not captured.
 
-The tracking extension must be loaded. With `--no-extensions`, explicitly add
+The extension must be loaded. With `--no-extensions`, explicitly add
 `-e ~/.pi/agent/extensions/herdr-recovery/index.js` (adjust for a custom agent
-directory). Disabling it means metadata cannot follow that run; old terminal
-metadata may remain. A conversation that never reached disk, was deleted, or
-ran with `--no-session` cannot be restored; the button opens the picker instead.
-This extension targets Pi's current `session_start` lifecycle (verified with
-Pi 1.5.0).
+directory). It has no npm dependencies. When it is installed, run `/reload`
+in existing Pi sessions to load it. It targets Pi's current `session_start`
+lifecycle (verified with Pi 1.5.0).
+
+#### Claude (`claude/herdr-resume/`)
+
+A Claude Code plugin, `herdr-resume`, in this repo's own marketplace
+(`claude/`). Its `SessionStart` and `Stop` hooks run `herdr-agent-report
+claude`, a small program built with Bun next to the stand-in
+(`suspend/report.ts`). It reads the hook's input, finds the Claude process
+above it and reads its exact argv, and writes the report: `argv` is
+`claude <launch options> --resume <session id>`, and the proof is the
+transcript Claude names. The transcript exists only after the first reply, so
+a new or cleared session gets an empty report until then. It skips print
+mode (`-p`, `--print`). It always exits 0 and prints nothing, so it never
+disturbs Claude. When the program isn't installed, the hooks do nothing.
+
+`./install.sh` installs the plugin for your user when `claude` is on `PATH`
+(see [Install](#install)). By hand:
+
+```sh
+claude plugin marketplace add "$PWD/claude"
+claude plugin install herdr-resume@herdr-tincho-config --scope user
+```
+
+Claude loads a folder marketplace in place, so an edit to the plugin applies
+at Claude's next session. The hooks find the program through
+`XDG_DATA_HOME`, so Claude must see the same value as the installer did.
+
+Claude's launch options (`herdr/mods/tab-tree/claude-options.js`):
+`--resume` alone doesn't keep the model.
+
+- Kept: `--model`, `--permission-mode`, `--effort`, `--fallback-model`,
+  `--agent`, `--setting-sources`, `--plugin-dir` and a few more with one
+  value; switches such as `--dangerously-skip-permissions` and `--verbose`;
+  the lists `--add-dir`, `--allowed-tools`, `--disallowed-tools` and `--tools`,
+  only when another option or `--` follows them (Claude takes a trailing
+  prompt into a list). Relative folders become absolute.
+- Never kept: prompts, system prompts, `--settings`, `--agents`,
+  `--mcp-config` (they can hold credentials), `--file`, `--betas`, and session
+  selectors (`--continue`, `--session-id`, `--name`).
+- An unknown option, or one with an optional value (`--resume`, `--debug`,
+  `--worktree`, ...), stops capture. The words after it are dropped.
+- A bare word in the middle of a list (`--add-dir /x text --model m`) is kept
+  as a folder, as Claude itself reads it.
 
 ## Suspending unused agents
 
@@ -353,11 +411,10 @@ The design and the facts checked for it: [`plans/agent-suspension.md`](plans/age
 
 An agent is suspended only when all of these hold:
 
-- It's resumable: Claude with its session label (`herdr.claude-session`)
-  and that session's transcript (`~/.claude/projects/<folder>/<id>.jsonl`),
-  or Pi with its record (`herdr.pi-recovery`) and a session file that holds
-  the recorded session. When the transcript or session file is missing, the
-  automatic pass tries that agent again after 5 minutes.
+- It's resumable: its terminal has a [resume report](#resume-report) from
+  the agent running there, and the report's proof file holds its session.
+  When the proof is missing, the automatic pass tries that agent again after
+  5 minutes.
 - It's `idle` or `done` for the threshold, counted from the later of its last
   status change and the last time its tab was focused.
 - Its tab isn't the focused tab of any Herdr window.
@@ -469,9 +526,9 @@ reaches it in two separate reads can become two messages). When
 `herdr-shell` waits on an error (below), it keeps the lines with text for
 the stand-in.
 
-When the session is gone (Pi's record names no session file, or the file is
-missing or has another id; Claude has no session id, or no transcript for
-it), the stand-in doesn't wake the agent. It saves the messages in
+The stand-in starts the report's `argv` directly (no shell) in its `cwd`.
+When the session is gone (no resume report, or its proof file is missing or
+holds another session), the stand-in doesn't wake the agent. It saves the messages in
 `${XDG_STATE_HOME:-~/.local/state}/herdr-tincho-config/undelivered/`,
 shows the file's path and reports `blocked`, so hc tells the parent. A wake
 that fails for another reason, or an unexpected error in the stand-in, ends
@@ -487,29 +544,6 @@ the report the stand-in made when the wake began, and the stand-in isn't in fron
 it reports `idle` for the terminal, once.
 In every other case it does nothing. The sidebar stops showing "waking…"
 after the same 30 s.
-
-### Claude launch options
-
-Recovery and waking start Claude with the options it was started with:
-`--resume` alone doesn't keep the model. Every 10 seconds, with the session
-id, the mod reads Claude's command line, keeps only known reusable options,
-and stores them in the `herdr.claude-options` label. ↻ then types, for
-example, `claude '--model' 'haiku' --resume '<id>'`. Without options the line
-is the same as before.
-
-- Kept: `--model`, `--permission-mode`, `--effort`, `--fallback-model`,
-  `--agent`, `--setting-sources`, `--plugin-dir` and a few more with one
-  value; switches such as `--dangerously-skip-permissions` and `--verbose`;
-  the lists `--add-dir`, `--allowed-tools`, `--disallowed-tools` and `--tools`,
-  only when another option or `--` follows them (Claude takes a trailing
-  prompt into a list). Relative folders become absolute.
-- Never kept: prompts, system prompts, `--settings`, `--agents`,
-  `--mcp-config` (they can hold credentials), `--file`, `--betas`, and session
-  selectors (`--continue`, `--session-id`, `--name`).
-- An unknown option, or one with an optional value (`--resume`, `--debug`,
-  `--worktree`, ...), stops capture. The words after it are dropped.
-- A bare word in the middle of a list (`--add-dir /x text --model m`) is kept
-  as a folder, as Claude itself reads it.
 
 ### Restarts, crashes and repairs
 
@@ -537,14 +571,19 @@ is the same as before.
   `bun build --compile --minify` (stable Bun: a bit more memory, much larger
   on disk). An idle stand-in uses about 7.5 MB. Without Bun it prints
   `suspend: skipped (no bun)` and leaves hc's `shell` setting alone.
-- Installs `herdr-standin` and `herdr-shell` into
+- The same build makes Claude's reporter, `herdr-agent-report` (see
+  [Claude](#claude-claudeherdr-resume)), and runs it once, so macOS's check
+  of a new program doesn't slow Claude's first hook.
+- Installs `herdr-standin`, `herdr-agent-report` and `herdr-shell` into
   `${XDG_DATA_HOME:-~/.local/share}/herdr-tincho-config/bin/`, which is not
   on `PATH`.
 - Records them in the `installed-suspend` manifest (next to `installed`), by
-  the hash of their sources. It rebuilds only when a source changes or the
-  binary is missing. Upgrading Bun doesn't rebuild: delete the installed
-  `herdr-standin` to get a build with the new Bun. A failed build keeps the
-  old binary and is tried again on the next run.
+  the hash of their sources (`suspend/`, and the `herdr/` modules they
+  import: `recipes.js`, `resume-report.js`, `claude-options.js`). It rebuilds
+  both only when a source changes or a binary is missing. Upgrading Bun
+  doesn't rebuild: delete the installed `herdr-standin` to get a build with
+  the new Bun. A failed build keeps the old binaries and is tried again on
+  the next run.
 - Sets `shell = ["<bin>/herdr-shell"]` in
   `${XDG_CONFIG_HOME:-~/.config}/herdr-core/config.toml` and keeps every other
   key. A different `shell` value is reported as a conflict and kept;
@@ -554,8 +593,17 @@ is the same as before.
   build failed), the key stays as it is. hc uses the new shell for programs
   it starts after that; running programs keep running.
 
-`herdr-shell` and `herdr-standin` are program files: a new version replaces
-them even when they were changed on this machine.
+`herdr-shell`, `herdr-standin` and `herdr-agent-report` are program files: a
+new version replaces them even when they were changed on this machine.
+
+With `claude` on `PATH` (Bun not needed), it also installs the Claude plugin:
+`claude plugin marketplace add <repo>/claude`, then
+`claude plugin install herdr-resume@herdr-tincho-config --scope user`. It
+does this once per repo folder (recorded in `installed-claude`); `--force`
+runs both again, and they change nothing when the plugin is there. Without
+`claude` it prints `claude: skipped (no claude on PATH)` and the two
+commands. A failure is reported, stops nothing else, and is tried again on
+the next run.
 
 Every new terminal starts through `herdr-shell`. It reads its terminal's
 labels with `hc get` and starts the stand-in when the terminal is suspended,
@@ -580,6 +628,8 @@ programs are installed and `herdr-shell` is hc's `shell`.
 - A 60 s heartbeat in Herdr's shared state keeps the leader choice. Every mod
   re-renders then.
 - About 15 ms per new terminal for `herdr-shell`'s label check.
+- No labeling timer: `herdr.last-agent` is written from render, when a pane
+  shows an agent its terminal hasn't recorded yet (one `hc label`, once).
 
 ### Known limits
 
@@ -612,8 +662,8 @@ programs are installed and `herdr-shell` is hc's `shell`.
 - Every new terminal pays about 15 ms for the label check.
 - Bun's small ahead-of-time compile is experimental and canary only today.
   The standard compile covers stable Bun.
-- Only Claude and Pi agents with session labels on this machine are
-  suspended.
+- Only agents with a resume report on this machine are suspended: today
+  Claude (with the plugin installed) and Pi (with the extension).
 - hc has no hook that runs a command when a message reaches a terminal. Such
   a hook would make the stand-in unnecessary; it's worth requesting
   ([ADR 0001](docs/adr/0001-suspended-agents-reached-through-a-stand-in.md)).

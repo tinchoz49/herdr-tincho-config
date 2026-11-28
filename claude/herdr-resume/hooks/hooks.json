@@ -1,0 +1,27 @@
+{
+  "description": "Runs herdr-agent-report, which install.sh builds into its bin folder. Does nothing when it is not installed.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "r=\"${XDG_DATA_HOME:-$HOME/.local/share}/herdr-tincho-config/bin/herdr-agent-report\"; [ -x \"$r\" ] || exit 0; exec \"$r\" claude",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "r=\"${XDG_DATA_HOME:-$HOME/.local/share}/herdr-tincho-config/bin/herdr-agent-report\"; [ -x \"$r\" ] || exit 0; exec \"$r\" claude",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

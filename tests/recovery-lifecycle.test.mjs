@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { registerHooks } from "node:module";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { LABEL, PI_RECOVERY } from "../herdr/mods/tab-tree/recipes.js";
+import { LABEL } from "../herdr/mods/tab-tree/recipes.js";
+import { RESUME } from "../herdr/mods/tab-tree/resume-report.js";
 
 // No subprocesses, real sessions, or session files. The 0.1.14 scheduler leaves
 // cancelled sleeps/host promises pending (scheduler.rs:534,1217). Model that,
@@ -25,8 +26,14 @@ let respond;
 const shell = { state: "live", pid: 1, foreground: { pid: 1 } };
 const running = { state: "live", pid: 1, foreground: { pid: 2 } };
 const ok = (value = "") => ({ code: 0, stdout: typeof value === "string" ? value : JSON.stringify(value) });
-const record = { version: 1, sessionId: "exact-session", sessionFile: "/fake/session.jsonl", cwd: "/fake/project", args: ["--thinking", "high"] };
-const labels = { [PI_RECOVERY]: JSON.stringify(record) };
+// Resume reports as the agents' plugins write them.
+const report = (agent, session, argv, proof) => ({ [RESUME]: JSON.stringify({ version: 1, agent, session, argv, cwd: "/fake/project", proof, pid: 7, at: 1 }) });
+const labels = report("pi", "exact-session", ["pi", "--session", "/fake/session.jsonl", "--thinking", "high"], "/fake/session.jsonl");
+const claudeLabels = report("claude", "saved-session", ["claude", "--resume", "saved-session"], "/fake/saved-session.jsonl");
+const PI_LINE = "cd '/fake/project' && 'pi' '--session' '/fake/session.jsonl' '--thinking' 'high'";
+const CLAUDE_LINE = "cd '/fake/project' && 'claude' '--resume' 'saved-session'";
+// Every proof file holds both sessions.
+const heads = ok({ sessionId: "saved-session", id: "exact-session" });
 const host = {
   hc: (...args) => invoke("hc", args), exec: (...args) => invoke("exec", args),
   spaces: () => [], panes: () => [], terminals: () => [], machines: () => [],
@@ -103,7 +110,7 @@ function sidebar(name, { immediateSleep = false } = {}) {
 function reset() {
   calls = [];
   violations = [];
-  respond = ({ kind, args }) => kind === "exec" ? ok({ type: "session", id: record.sessionId }) : args[0][0] === "get" ? ok(shell) : ok();
+  respond = ({ kind, args }) => kind === "exec" ? heads : args[0][0] === "get" ? ok(shell) : ok();
 }
 const sends = (owner) => calls.filter((c) => c.kind === "hc" && c.args[0][0] === "send" && (!owner || c.owner === owner)).map((c) => c.args[0]);
 
@@ -171,7 +178,7 @@ for (const boundary of boundaries) {
     assert.equal(calls.filter((c) => c.owner === old.owner).length, oldCalls);
     // Native cancellation normally leaves the gate pending. Also exercise a
     // result whose JS continuation was ready when synchronous close ran.
-    gate.resolve(boundary === "Pi file exec" ? ok({ type: "session", id: record.sessionId }) : ok(boundary === "Claude final report get" ? running : shell));
+    gate.resolve(boundary === "Pi file exec" ? heads : ok(boundary === "Claude final report get" ? running : shell));
     await flush();
     await Promise.all(old.owner.tasks);
     assert.equal(calls.filter((c) => c.owner === old.owner).length, oldCalls, "no stale probes, retries, /exit, or queued exec");
@@ -207,10 +214,10 @@ test("rejected recovery releases the owner's queue and exact Pi recovery stays o
   await Promise.all(copy.owner.tasks);
   assert.deepEqual(sends(), [
     ["send", "failed", "claude --resume"],
-    ["send", "pi", "pi --session '/fake/session.jsonl' '--thinking' 'high'"],
+    ["send", "pi", PI_LINE],
   ]);
   assert.equal(copy.owner.sleeps.length, 0);
-  assert.deepEqual(calls.filter((c) => c.kind === "exec").map((c) => c.args), [["sh", ["-c", 'test -f "$1" && head -c 4096 "$1"', "sh", record.sessionFile]]]);
+  assert.deepEqual(calls.filter((c) => c.kind === "exec").map((c) => c.args), [["sh", ["-c", 'test -f "$1" && head -c "$2" "$1"', "sh", "/fake/session.jsonl", "4096"]]]);
 });
 
 test("Claude retries remain serial, bounded, and hold queued Pi until they finish", async () => {
@@ -220,21 +227,22 @@ test("Claude retries remain serial, bounded, and hold queued Pi until they finis
   respond = ({ args }) => {
     const [verb, address, line] = args[0];
     if (verb === "send" && address === "claude") exiting = line === "/exit";
+    if (verb === "s") return heads; // the proof check (exec sh ...)
     return verb === "get" ? ok(address === "pi" || exiting ? shell : running) : ok();
   };
-  copy.click("claude", "claude", { "herdr.claude-session": "saved-session" });
+  copy.click("claude", "claude", claudeLabels);
   copy.click("pi");
   for (let i = 0; i < 30; i++) await flush();
   await Promise.all(copy.owner.tasks);
   assert.deepEqual(sends(), [
-    ["send", "claude", "claude --resume 'saved-session'"], ["send", "claude", "/exit"],
-    ["send", "claude", "claude --resume 'saved-session'"], ["send", "claude", "/exit"],
-    ["send", "claude", "claude --resume 'saved-session'"], ["send", "claude", "/exit"],
+    ["send", "claude", CLAUDE_LINE], ["send", "claude", "/exit"],
+    ["send", "claude", CLAUDE_LINE], ["send", "claude", "/exit"],
+    ["send", "claude", CLAUDE_LINE], ["send", "claude", "/exit"],
     ["send", "pi", "pi --resume"],
   ]);
   assert.equal(copy.owner.sleeps.length, 120);
   assert.ok(copy.owner.sleeps.every(({ ms }) => ms === 500));
-  assert.deepEqual(copy.owner.timers.map(({ ms }) => ms), [3000, 10000, 15000], "polling intervals unchanged");
+  assert.deepEqual(copy.owner.timers.map(({ ms }) => ms), [15000], "the suspension pass is the only periodic work");
 });
 
 test("closing one simultaneous sidebar does not cancel another owner's queue", async () => {
@@ -250,7 +258,7 @@ test("closing one simultaneous sidebar does not cancel another owner's queue", a
   second.click("second", "pi", labels);
   first.close();
   await flush();
-  assert.deepEqual(sends(second.owner), [["send", "second", "pi --session '/fake/session.jsonl' '--thinking' 'high'"]]);
+  assert.deepEqual(sends(second.owner), [["send", "second", PI_LINE]]);
   assert.deepEqual(sends(first.owner), []);
 });
 
@@ -262,9 +270,9 @@ const standin = { ...shell, labels: { "herdr.suspended": JSON.stringify({ versio
 for (const agent of ["pi", "claude"]) {
   test(`a stale ↻ click types nothing into a suspended ${agent} agent's stand-in`, async () => {
     reset();
-    respond = ({ kind, args }) => kind === "exec" ? ok({ type: "session", id: record.sessionId }) : args[0][0] === "get" ? ok(standin) : ok();
+    respond = ({ kind, args }) => kind === "exec" ? heads : args[0][0] === "get" ? ok(standin) : ok();
     const copy = sidebar("owner", { immediateSleep: true });
-    copy.click("t7", agent, agent === "pi" ? labels : { "herdr.claude-session": "saved-session" });
+    copy.click("t7", agent, agent === "pi" ? labels : claudeLabels);
     for (let i = 0; i < 5; i++) await flush();
     await Promise.all(copy.owner.tasks);
     assert.deepEqual(sends(), []);
@@ -276,7 +284,7 @@ test("recovery types nothing while a stand-in wakes its agent, label already rem
   // The stand-in removed its label and replaced itself with the agent, which
   // has not reported yet: the stand-in's "working" report is still there.
   const waking = { ...shell, labels: {}, status: { app: "herdr-standin", state: "working" } };
-  respond = ({ kind, args }) => kind === "exec" ? ok({ type: "session", id: record.sessionId }) : args[0][0] === "get" ? ok(waking) : ok();
+  respond = ({ kind, args }) => kind === "exec" ? heads : args[0][0] === "get" ? ok(waking) : ok();
   const copy = sidebar("owner", { immediateSleep: true });
   copy.click("t7", "pi", labels);
   copy.click("t8", "claude");
@@ -300,11 +308,11 @@ for (const [what, front, ageMs, typed] of [
 ]) {
   test(`recovery after a wake whose agent never reported: ${what}`, async () => {
     reset();
-    respond = ({ kind, args }) => kind === "exec" ? ok({ type: "session", id: record.sessionId }) : args[0][0] === "get" ? ok(staleWake(front, ageMs)) : ok();
+    respond = ({ kind, args }) => kind === "exec" ? heads : args[0][0] === "get" ? ok(staleWake(front, ageMs)) : ok();
     const copy = sidebar("owner", { immediateSleep: true });
     copy.click("t7", "pi", labels);
     for (let i = 0; i < 5; i++) await flush();
     await Promise.all(copy.owner.tasks);
-    assert.deepEqual(sends(), typed ? [["send", "t7", "pi --session '/fake/session.jsonl' '--thinking' 'high'"]] : []);
+    assert.deepEqual(sends(), typed ? [["send", "t7", PI_LINE]] : []);
   });
 }

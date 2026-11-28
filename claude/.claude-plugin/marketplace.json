@@ -1,0 +1,12 @@
+{
+  "name": "herdr-tincho-config",
+  "owner": { "name": "Martin Acosta" },
+  "metadata": { "description": "Claude Code plugins of herdr-tincho-config" },
+  "plugins": [
+    {
+      "name": "herdr-resume",
+      "source": "./herdr-resume",
+      "description": "Writes Claude's resume report (herdr.resume) into its hc terminal, so Herdr can recover, suspend and wake the conversation"
+    }
+  ]
+}

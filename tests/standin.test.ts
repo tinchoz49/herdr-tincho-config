@@ -11,10 +11,19 @@ const SESSION_FILE = "/sessions/pi.jsonl";
 const PI_RECORD = JSON.stringify({ version: 1, sessionId: "pi-id", sessionFile: SESSION_FILE, cwd: "/recorded", args: ["--model", "m"] });
 const SINCE = new Date(2026, 10, 16, 14, 5).getTime();
 const suspended = (root: "shell" | "agent", agent = "pi") => JSON.stringify({ version: 1, agent, root, cwd: "/project", since: SINCE });
-const piLabels = (root: "shell" | "agent" = "agent") => ({ "herdr.suspended": suspended(root), "herdr.pi-recovery": PI_RECORD });
-const claudeLabels = (root: "shell" | "agent" = "agent") => ({ "herdr.suspended": suspended(root, "claude"), "herdr.claude-session": "claude-id" });
-
 const PROJECTS = "/home/me/.claude/projects";
+const CLAUDE_PROOF = `${PROJECTS}/-project/claude-id.jsonl`;
+// Resume reports as the agents' plugins write them.
+const resume = (agent: string, session: string, argv: string[], proof: string) =>
+  JSON.stringify({ version: 1, agent, session, argv, cwd: "/project", proof, pid: 41, at: 1 });
+const PI_REPORT = resume("pi", "pi-id", ["pi", "--session", SESSION_FILE, "--model", "m"], SESSION_FILE);
+const CLAUDE_REPORT = resume("claude", "claude-id", ["claude", "--resume", "claude-id"], CLAUDE_PROOF);
+const piLabels = (root: "shell" | "agent" = "agent") => ({ "herdr.suspended": suspended(root), "herdr.resume": PI_REPORT });
+const claudeLabels = (root: "shell" | "agent" = "agent") => ({ "herdr.suspended": suspended(root, "claude"), "herdr.resume": CLAUDE_REPORT });
+// The labels written before herdr.resume (the legacy adapter reads them).
+const legacyPi = (root: "shell" | "agent" = "agent") => ({ "herdr.suspended": suspended(root), "herdr.pi-recovery": PI_RECORD });
+const legacyClaude = (root: "shell" | "agent" = "agent") => ({ "herdr.suspended": suspended(root, "claude"), "herdr.claude-session": "claude-id" });
+
 // Claude's transcripts: <id>.jsonl in a folder per project.
 const TRANSCRIPTS: Record<string, string[]> = { "-other": ["x.jsonl"], "-project": ["claude-id.jsonl", "abc.jsonl"] };
 
@@ -66,7 +75,7 @@ function fake(options: Options = {}) {
       if (options.files && path in options.files) return options.files[path] ?? null;
       if (path === SESSION_FILE) return '{"type":"session","id":"pi-id"}\n{"type":"message"}';
       const [folder, file] = path.startsWith(`${PROJECTS}/`) ? path.slice(PROJECTS.length + 1).split("/") : [];
-      return transcripts[folder]?.includes(file) ? '{"type":"summary"}' : null;
+      return transcripts[folder]?.includes(file) ? `{"sessionId":"${file.replace(/\.jsonl$/, "")}"}` : null;
     },
     save: async (path, text) => { if (options.saveFails) throw new Error("read-only file system"); steps.push(`save ${path}`); saved[path] = text; },
     chdir: (path) => { steps.push(`chdir ${path}`); return null; },
@@ -378,8 +387,8 @@ describe("wake", () => {
     expect(await tail({ platform: "linux" }, [])).toBe("\n");
   });
 
-  test("Claude wakes from its recorded session id, in the record's folder", async () => {
-    const t = fake({ labels: { ...claudeLabels("agent"), "herdr.claude-session": "abc" } });
+  test("legacy labels: Claude wakes from its recorded session id, in the record's folder", async () => {
+    const t = fake({ labels: { ...legacyClaude("agent"), "herdr.claude-session": "abc" } });
     await t.start(["claude", "t9", "worker"]);
     await t.input("\r");
     await t.tick(500);
@@ -387,12 +396,43 @@ describe("wake", () => {
     expect(t.steps).toContain("chdir /project");
   });
 
-  test("Claude wakes with its recorded launch options, as recovery starts it", async () => {
-    const t = fake({ labels: { ...claudeLabels("agent"), "herdr.claude-options": JSON.stringify({ version: 1, options: ["--model", "haiku"] }) } });
+  test("legacy labels: Claude wakes with its recorded launch options, as recovery starts it", async () => {
+    const t = fake({ labels: { ...legacyClaude("agent"), "herdr.claude-options": JSON.stringify({ version: 1, options: ["--model", "haiku"] }) } });
     await t.start(["claude", "t9", "worker"]);
     await t.input(paste("hi"));
     await t.tick(500);
     expect(t.execs).toEqual([["claude", "--model", "haiku", "--resume", "claude-id", "--", "hi"]]);
+  });
+
+  test("a report written by a plugin wakes with its exact argv, in its own folder", async () => {
+    const argv = ["/opt/bin/claude", "--model", "it's haiku", "--add-dir", "/a b", "--resume", "claude-id"];
+    const labels = { "herdr.suspended": suspended("agent", "claude"),
+      "herdr.resume": JSON.stringify({ version: 1, agent: "claude", session: "claude-id", argv, cwd: "/elsewhere", proof: CLAUDE_PROOF, pid: 9, at: 2 }) };
+    const t = fake({ labels });
+    await t.start(["claude", "t9", "worker"]);
+    await t.input(paste("hi"));
+    await t.tick(500);
+    expect(t.execs).toEqual([[...argv, "--", "hi"]]);
+    expect(t.steps).toContain("chdir /elsewhere");
+    expect(t.steps).not.toContain("chdir /project");
+  });
+
+  test("legacy labels: Pi wakes from its recovery record, in its recorded folder", async () => {
+    const t = fake({ labels: legacyPi("agent") });
+    await t.start();
+    await t.input(paste("hi"));
+    await t.tick(500);
+    expect(t.execs).toEqual([[...PI_WAKE, "--", "hi"]]);
+    expect(t.steps).toContain("chdir /recorded");
+  });
+
+  test("a report from another agent than the suspended one does not wake it", async () => {
+    const t = fake({ labels: { "herdr.suspended": suspended("agent"), "herdr.resume": CLAUDE_REPORT } });
+    await t.start();
+    await t.input("\r");
+    await t.tick(500);
+    expect(t.execs).toEqual([]);
+    expect(t.screen()).toContain("pi not woken: it has no resume report");
   });
 
   test("a failed replacement puts the label back and keeps the messages", async () => {
@@ -440,8 +480,8 @@ describe("failed wakes and errors", () => {
 
   test("an error inside the wake takes the missing-session path, and the stand-in still wakes later", async () => {
     let first = true;
-    const t = fake({ files: {} });
-    t.sys.readHead = async () => { if (first) { first = false; throw new Error("disk gone"); } return '{"type":"session","id":"pi-id"}'; };
+    const t = fake();
+    t.sys.chdir = () => { if (first) { first = false; throw new Error("disk gone"); } return null; };
     await t.start();
     await t.input(paste("one"));
     await t.tick(500);
@@ -584,12 +624,15 @@ describe("missing session", () => {
   for (const [name, options] of [
     ["the Pi session file is absent", { files: { [SESSION_FILE]: undefined as unknown as string } }],
     ["the Pi session file holds another id", { files: { [SESSION_FILE]: '{"type":"session","id":"other"}' } }],
-    ["the Pi record has no session file", { labels: { "herdr.suspended": suspended("agent"), "herdr.pi-recovery": JSON.stringify({ version: 1, sessionId: "pi-id", cwd: "/r", args: [] }) } }],
-    ["there is no Pi record", { labels: { "herdr.suspended": suspended("agent") } }],
-    ["Claude has no session id", { labels: { "herdr.suspended": suspended("agent", "claude") } }],
-    ["Claude's session has no transcript", { labels: claudeLabels(), transcripts: { "-project": ["another.jsonl"] } }],
-    ["Claude has no projects folder", { labels: claudeLabels(), transcripts: {} }],
-    ["Claude's session id is a path", { labels: { ...claudeLabels(), "herdr.claude-session": "../-project/claude-id" } }],
+    ["the report is empty (nothing to resume)", { labels: { "herdr.suspended": suspended("agent"), "herdr.resume": "", "herdr.pi-recovery": PI_RECORD } }],
+    ["the report is broken", { labels: { "herdr.suspended": suspended("agent"), "herdr.resume": "{" } }],
+    ["Claude's transcript is missing", { labels: claudeLabels(), transcripts: { "-project": ["another.jsonl"] } }],
+    ["legacy: the Pi record has no session file", { labels: { "herdr.suspended": suspended("agent"), "herdr.pi-recovery": JSON.stringify({ version: 1, sessionId: "pi-id", cwd: "/r", args: [] }) } }],
+    ["there is no report", { labels: { "herdr.suspended": suspended("agent") } }],
+    ["Claude has no report", { labels: { "herdr.suspended": suspended("agent", "claude") } }],
+    ["legacy: Claude's session has no transcript", { labels: legacyClaude(), transcripts: { "-project": ["another.jsonl"] } }],
+    ["legacy: Claude has no projects folder", { labels: legacyClaude(), transcripts: {} }],
+    ["legacy: Claude's session id is a path", { labels: { ...legacyClaude(), "herdr.claude-session": "../-project/claude-id" } }],
   ] as [string, Options][]) {
     test(`${name}: messages saved, path shown, blocked reported, no wake`, async () => {
       const t = await missing(options);
@@ -603,6 +646,13 @@ describe("missing session", () => {
       expect(reports(t.screen()).at(-1)).toBe("blocked");
     });
   }
+
+  test("a missing proof refuses the wake with the reason", async () => {
+    const t = await missing({ files: { [SESSION_FILE]: undefined as unknown as string } });
+    expect(t.screen()).toContain(`pi not woken: its conversation file ${SESSION_FILE} is missing or holds another session.`);
+    const legacy = await missing({ labels: legacyClaude(), transcripts: {} }, ["claude", "t1/x", "worker"]);
+    expect(legacy.screen()).toContain("claude not woken: its session claude-id has no conversation on disk.");
+  });
 
   test("repeated empty wakes (Enter presses) report blocked each time, and show their reason once", async () => {
     const t = fake({ labels: { "herdr.suspended": suspended("agent", "claude") } });
@@ -623,7 +673,7 @@ describe("missing session", () => {
     await t.tick(500);
     expect(t.screen()).toContain("secret plan");
     const msg = t.screen().match(/state=blocked:app=herdr-standin:msg=([A-Za-z0-9+/=]+)/)![1];
-    expect(Buffer.from(msg, "base64").toString()).toBe("claude not woken: Claude has no session id. Could not save the messages: read-only file system");
+    expect(Buffer.from(msg, "base64").toString()).toBe("claude not woken: it has no resume report. Could not save the messages: read-only file system");
   });
 
   test("the undelivered folder defaults to ~/.local/state", async () => {

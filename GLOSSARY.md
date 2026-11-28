@@ -19,8 +19,12 @@ A shell that is a terminal's main program and runs an agent in front of it.
 **Agent**:
 A coding-agent program (Claude, Pi) running in a terminal and reporting its status to Herdr.
 
+**Resume report**:
+What an agent's own plugin writes on its terminal (the `herdr.resume` label) to say how to continue its conversation: the agent, the session, the command with its launch options, the folder, and the proof file that holds the conversation. One format for every agent.
+_Avoid_: Recipe, recovery metadata, session label
+
 **Resumable agent**:
-An agent whose terminal records which agent ran and the session to resume, so a recipe can start it again with its conversation.
+An agent that has a resume report whose proof is on disk: the proof file exists and names the report's session.
 
 ## Suspension
 

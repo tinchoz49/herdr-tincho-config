@@ -1,13 +1,12 @@
 // Bringing an agent back in a terminal that lost it (hc server stop, a crash,
-// a reboot). herdr-core keeps nothing of the program it lost: the mod labels
-// each terminal with the agent it last ran (LABEL, kept by the core across
-// restarts), and recipes.js says how each agent starts again.
+// a reboot). herdr-core keeps nothing of the program it lost: each agent's
+// plugin leaves its resume report on the terminal (resume-report.js), and the
+// core keeps the labels across restarts.
 
 import { hc, exec } from "herdr";
-import { isClaude, processIdentity, claudeLaunchWords } from "./claude-polling.js";
-
-import { LABEL, SESSION, CLAUDE_OPTIONS, PI_RECOVERY, SUSPENDED, STANDIN_APP, piRecovery, holdsPiSession, recoveryLine, claudeOptionsLabel } from "./recipes.js";
-export { LABEL, SESSION, RECIPES } from "./recipes.js";
+import { LABEL, SUSPENDED, STANDIN_APP, pickerLine } from "./recipes.js";
+import { reportOf, resumeLine, proofHeld } from "./resume-report.js";
+export { LABEL, hasPicker } from "./recipes.js";
 
 // Types a command line into the terminal's shell, so the person's own agent
 // commands (functions, wrappers) run it.
@@ -141,86 +140,91 @@ export function createRecovery() {
     // Synchronous: close drains JS jobs before the host retires this copy.
     // Already-issued commands cannot be recalled; forbid every follow-up.
     close() { closed = true; queue = Promise.resolve(); },
-    recover(cx, address, agent, labels, tab) {
-      // Read the terminal just before typing: a ↻ shown before a suspension
-      // (a stale click) must not type into the stand-in.
-      if (agent !== "pi") return enqueue(async () => {
+    // ↻: the line its resume report gives, run in the report's folder. Without
+    // a report, or when the report's conversation is not on disk, the agent's
+    // picker (spec Q1). target: agent (the last-agent label), labels, tab (the
+    // tab's name, for Claude's picker), cwd (the shell's folder: a legacy
+    // Claude report names none).
+    /** @param {{ agent?: string | null, labels?: Record<string, string>, tab?: string | null, cwd?: string | null }} target */
+    recover(cx, address, { agent = null, labels = {}, tab = null, cwd = null } = {}) {
+      return enqueue(async () => {
+        const line = await recoveryLine(labels, { agent, tab, cwd });
+        check();
+        if (!line) return;
+        // Read the terminal just before typing: a ↻ shown before a suspension
+        // (a stale click) must not type into the stand-in.
         const current = await info(address);
         check();
         if (!current || standin(current)) return;
-        await attempt(cx, address, recoveryLine(agent, labels, { tab }), check);
-      });
-      // Pi must not use Claude's report timeout and /exit retry: its session
-      // picker can wait indefinitely. Send once, only while still at a shell.
-      return enqueue(async () => {
-        const recovery = piRecovery(labels[PI_RECOVERY]);
-        let picker = false;
-        if (recovery?.sessionFile) {
-          picker = !await piSessionHeld(recovery);
-          check();
+        // Pi must not use Claude's report timeout and /exit retry: its session
+        // picker can wait indefinitely. Send once, only while still at a shell.
+        if (line.agent === "pi") {
+          if (current.state === "live" && atShell(current)) await send(address, line.text);
+          return;
         }
-        const current = await info(address);
-        check();
-        if (!current || current.state !== "live" || !atShell(current) || standin(current)) return;
-        await send(address, recoveryLine("pi", labels, { picker }));
+        await attempt(cx, address, line.text, check);
       });
     },
   };
 }
 
-// Whether the session file a Pi record names holds that session. A missing or
-// empty file would start a NEW Pi conversation; a bounded header, with its ID,
-// shows that a replaced file is not another conversation.
-/** @param {{ sessionId: string, sessionFile?: string | null } | null} recovery */
-export async function piSessionHeld(recovery) {
-  if (!recovery?.sessionFile) return false;
-  const file = await exec("sh", ["-c", 'test -f "$1" && head -c 4096 "$1"', "sh", recovery.sessionFile]).catch(() => /** @type {null} */ (null));
-  return file?.code === 0 && holdsPiSession(file.stdout, recovery.sessionId);
+// What ↻ types for a terminal, and for which agent: its report's line while
+// the conversation is on disk, else the picker. null: nothing to recover.
+/**
+ * @param {Record<string, string>} labels
+ * @param {{ agent?: string | null, tab?: string | null, cwd?: string | null }} [options]
+ * @returns {Promise<{ agent: string, text: string } | null>}
+ */
+export async function recoveryLine(labels, { agent = null, tab = null, cwd = null } = {}) {
+  const report = reportOf(labels, { agent, cwd });
+  if (report && await reportHeld(report)) return { agent: report.agent, text: resumeLine(report) };
+  const picker = report?.agent ?? agent;
+  const text = picker ? pickerLine(picker, { tab, report }) : null;
+  return text ? { agent: picker, text } : null;
 }
 
-// Whether Claude keeps a transcript of a session: <id>.jsonl in any project
-// folder under ~/.claude/projects. A Claude that never got a prompt names a
-// session in ~/.claude/sessions that has none, and --resume cannot find it.
-/** @param {unknown} id */
-export async function claudeTranscript(id) {
-  if (typeof id !== "string" || !id || /[\x00-\x1f\x7f/]/.test(id)) return false;
-  const script = 'for f in "$HOME"/.claude/projects/*/"$1.jsonl"; do test -f "$f" && exit 0; done; exit 1';
-  const r = await exec("sh", ["-c", script, "sh", id]).catch(() => /** @type {null} */ (null));
-  return r?.code === 0;
+// Whether ↻ has anything to offer: a report, or a picker for the last agent.
+// The agent it names, or null.
+/** @param {Record<string, string>} labels @param {{ agent?: string | null, cwd?: string | null }} [options] */
+export function recoverable(labels, { agent = null, cwd = null } = {}) {
+  const report = reportOf(labels, { agent, cwd });
+  if (report) return report.agent;
+  return agent && pickerLine(agent) ? agent : null;
+}
+
+// proofHeld's file access for one report, through processes the host runs.
+// readHead: the first bytes of a regular file, or null. list: only the
+// folders that hold the report's <session>.jsonl, which is all proofHeld looks
+// for in a listing (a legacy Claude report): one process instead of one per
+// project folder. home: read from the shell, only for that report.
+/** @param {import("./resume-report.js").ResumeReport} report @returns {Promise<Parameters<typeof proofHeld>[1]>} */
+async function proofIo(report) {
+  let home = "";
+  if (report.legacy && !report.proof) {
+    const r = await exec("sh", ["-c", 'printf %s "$HOME"']).catch(() => /** @type {null} */ (null));
+    if (r?.code === 0 && r.stdout.startsWith("/")) home = r.stdout;
+  }
+  return {
+    async readHead(path, bytes) {
+      const r = await exec("sh", ["-c", 'test -f "$1" && head -c "$2" "$1"', "sh", path, String(bytes)]).catch(() => /** @type {null} */ (null));
+      return r?.code === 0 ? r.stdout : null;
+    },
+    async list(dir) {
+      const script = 'cd "$1" || exit 1; for f in */"$2.jsonl"; do test -f "$f" && printf "%s\\n" "${f%%/*}"; done; exit 0';
+      const r = await exec("sh", ["-c", script, "sh", dir, report.session]).catch(() => /** @type {null} */ (null));
+      return r?.code === 0 ? r.stdout.split("\n").filter(Boolean) : [];
+    },
+    home,
+  };
+}
+
+// Whether a report's conversation is on disk (resume-report.js proofHeld),
+// read with processes: ↻ and the suspension rules' slow rule.
+/** @param {import("./resume-report.js").ResumeReport | null} report */
+export async function reportHeld(report) {
+  return Boolean(report) && proofHeld(report, await proofIo(/** @type {any} */ (report)));
 }
 
 export function remember(address, agent) {
   return hc(["label", address, `${LABEL}=${agent}`]);
-}
-
-// The Claude session running in front in a terminal, or null: its id and its
-// CLAUDE_OPTIONS label value (null: no options). Claude writes
-// ~/.claude/sessions/<pid>.json for each running process (sessionId follows
-// /clear and /resume inside it). The options come from the argv of that same
-// process.
-export async function claudeLaunch(address, expected) {
-  const j = await info(address);
-  const pid = j?.foreground?.pid;
-  if (j?.state !== "live" || !isClaude(j) || !Number.isSafeInteger(pid) || pid <= 0) return null;
-  if ((expected?.pid != null && expected.pid !== j.pid) ||
-      (expected?.foreground?.pid != null && expected.foreground.pid !== pid)) return null;
-  const identity = processIdentity(j);
-  const options = claudeOptionsLabel(claudeLaunchWords(j), j.foreground.cwd);
-  const r = await exec("sh", ["-c", 'cat "$HOME/.claude/sessions/$1.json"', "sh", String(pid)]).catch(() => null);
-  let id;
-  try { id = r?.code === 0 ? JSON.parse(r.stdout).sessionId : null; } catch { return null; }
-  if (typeof id !== "string" || !id || /[\x00-\x1f\x7f]/.test(id)) return null;
-  // The file read yields to other work. Reject a process switch even if the
-  // app's terminals() snapshot has not caught up with the core yet.
-  const after = await info(address);
-  return after?.state === "live" && isClaude(after) && processIdentity(after) === identity ? { id, options } : null;
-}
-
-// Writes what changed of a claudeLaunch result, in one label call: the
-// session, and the options (removed when the process has none).
-export async function rememberClaudeLaunch(address, { id, options }, labels = {}) {
-  const changes = [];
-  if (labels[SESSION] !== id) changes.push(`${SESSION}=${id}`);
-  if ((labels[CLAUDE_OPTIONS] ?? null) !== options) changes.push(`${CLAUDE_OPTIONS}=${options ?? ""}`);
-  return changes.length ? hc(["label", address, ...changes]) : null;
 }

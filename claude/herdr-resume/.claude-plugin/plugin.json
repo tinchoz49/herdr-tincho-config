@@ -1,0 +1,6 @@
+{
+  "name": "herdr-resume",
+  "version": "1.0.0",
+  "description": "Writes Claude's resume report (herdr.resume) into its hc terminal, so Herdr can recover, suspend and wake the conversation",
+  "author": { "name": "Martin Acosta" }
+}

@@ -3,10 +3,13 @@
 // Started by herdr-shell as `herdr-standin <agent> <address> <name> [shell arguments...]`.
 //
 // Everything that touches the process or the terminal goes through System, so
-// tests replace it with fakes. The start command comes from the shared recipe
-// module that recovery uses; this file builds it into the binary.
+// tests replace it with fakes. The start command is the agent's resume report
+// (resume-report.js), which recovery reads too; this file builds that module
+// and recipes.js into the binary (install.sh rebuilds on a change to either,
+// as both are imported here directly).
 
-import { PI_RECOVERY, SESSION, STANDIN_APP, SUSPENDED, holdsPiSession, shellQuote, piRecovery, recipe, suspension, type Suspension } from "../herdr/mods/tab-tree/recipes.js";
+import { STANDIN_APP, SUSPENDED, shellQuote, suspension, type Suspension } from "../herdr/mods/tab-tree/recipes.js";
+import { reportOf, proofMissing } from "../herdr/mods/tab-tree/resume-report.js";
 import { createInput, trimLineBreaks, type InputEvent } from "./input";
 import { watchdog } from "./watchdog";
 
@@ -62,10 +65,9 @@ const clock = (ms: number) => { const d = new Date(ms); return `${pad(d.getHours
 type Suspended = { record: Suspension; labels: Record<string, string> };
 
 const describe = (error: unknown) => (error instanceof Error ? error.message : String(error));
-const printable = (s: unknown): s is string => typeof s === "string" && s.length > 0 && !/[\x00-\x1f\x7f]/.test(s);
 
 export async function standin(args: string[], sys: System): Promise<void> {
-  const [agentArg = "agent", address = "", name = "", ...shellArgs] = args;
+  const [agentArg = "agent", address = "", _tabName = "", ...shellArgs] = args;
   // The user's shell starts with the arguments hc gave herdr-shell. hc starts
   // login shells on macOS, and a configured shell gets none, so -l there.
   const shellWords = shellArgs.length ? shellArgs : sys.platform === "darwin" ? ["-l"] : [];
@@ -126,41 +128,22 @@ export async function standin(args: string[], sys: System): Promise<void> {
   const suspended: Suspended | { cannotWake: string } = labels === null ? { cannotWake: `hc could not read terminal ${address}` }
     : record === null ? { cannotWake: "its suspension record is unreadable" } : { record, labels };
 
-  // Why the recorded session cannot be resumed, or null. Never a picker or a new conversation.
-  async function sessionMissing({ record, labels }: Suspended): Promise<string | null> {
-    if (record.agent === "claude") {
-      const id = labels[SESSION];
-      if (!printable(id)) return "Claude has no session id";
-      return await claudeTranscript(id) ? null : `Claude's session ${id} has no transcript`;
-    }
-    const recovery = piRecovery(labels[PI_RECOVERY]);
-    if (!recovery?.sessionFile) return "Pi has no session file";
-    const head = await sys.readHead(recovery.sessionFile);
-    return holdsPiSession(head, recovery.sessionId) ? null : `its session file ${recovery.sessionFile} is missing or holds another session`;
-  }
-
-  // Claude keeps a session's conversation in ~/.claude/projects/<folder>/<id>.jsonl.
-  // A session id without that file cannot be resumed (fact F2 in plans/agent-suspension.md).
-  async function claudeTranscript(id: string): Promise<boolean> {
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id)) return false;
-    const projects = `${sys.env.HOME ?? ""}/.claude/projects`;
-    for (const folder of await sys.list(projects)) {
-      if (await sys.readHead(`${projects}/${folder}/${id}.jsonl`) !== null) return true;
-    }
-    return false;
-  }
+  // proofMissing's file access: the stand-in's own system.
+  const proofIo = { readHead: (path: string) => sys.readHead(path), list: (dir: string) => sys.list(dir), home: sys.env.HOME ?? "" };
 
   // Returns only when the agent was not woken, with the reason.
   async function tryWake(): Promise<string> {
     if ("cannotWake" in suspended) return suspended.cannotWake;
-    const missing = await sessionMissing(suspended);
-    if (missing) return missing;
     const { record, labels } = suspended;
-    const start = recipe(record.agent, labels, { tab: name || null, picker: false });
-    if (!start) return `${agent} has no recipe`;
+    // The report of the suspended agent; a legacy Claude report runs in the
+    // record's folder. Never a picker or a new conversation.
+    const found = reportOf(labels, { agent: record.agent, cwd: record.cwd });
+    const start = found?.agent === record.agent ? found : null;
+    const missing = await proofMissing(start, proofIo);
+    if (missing || !start) return missing ?? "it has no resume report";
     reportStatus("working");
     sys.write(`waking ${agent}…\r\n`);
-    const cwd = start.cwd ?? record.cwd;
+    const cwd = start.cwd;
     const chdirError = sys.chdir(cwd);
     if (chdirError) return `cannot enter ${cwd}: ${chdirError}`;
     if ((await hc(["label", address, `${SUSPENDED}=`])).code !== 0) return "hc could not remove its suspension label";

@@ -5,13 +5,18 @@
 # pi/ goes under $PI_CODING_AGENT_DIR, else ~/.pi/agent, only when ~/.pi is
 # an existing directory or PI_CODING_AGENT_DIR is explicitly set to a nonempty path.
 # Otherwise Pi is skipped; no Pi directory or manifest is created.
-# With Bun on PATH, it also builds the suspended agents' stand-in
-# (suspend/build.sh) and installs it with its launcher, herdr-shell, into
+# With Bun on PATH, it also builds the suspended agents' stand-in and Claude's
+# resume reporter, herdr-agent-report (both by suspend/build.sh), and installs
+# them with the stand-in's launcher, herdr-shell, into
 # $XDG_DATA_HOME/herdr-tincho-config/bin (else ~/.local/share/...), which
 # is not on PATH. Then it points herdr-core's `shell` setting at that
 # herdr-shell, in $XDG_CONFIG_HOME/herdr-core/config.toml (else ~/.config/...), and
 # changes no other key. A different `shell` value is reported and kept.
 # Without Bun that part is skipped, and the `shell` key is left unchanged.
+# With `claude` on PATH, it installs the Claude plugin herdr-resume (which runs
+# herdr-agent-report) from this repo's marketplace, claude/, for the user. It
+# does that once per repo folder (installed-claude); --force does it again.
+# Without `claude` that part is skipped. A failure there stops nothing else.
 #
 #   ./install.sh            install what changed
 #   ./install.sh --watch    and again on every save (polls once a second)
@@ -22,8 +27,8 @@
 # $XDG_STATE_HOME/herdr-tincho-config/installed, or installed-pi for Pi).
 # A file someone changed on this machine since the last install is skipped instead of
 # overwritten. Files removed from the repo are reported, never deleted.
-# The stand-in is recorded by the hash of its sources (installed-suspend), so
-# it is rebuilt only when they change.
+# The stand-in and the reporter are recorded by the hash of their sources
+# (installed-suspend), so they are rebuilt only when those change.
 set -eu
 
 repo=$(cd "$(dirname "$0")" && pwd)
@@ -139,16 +144,29 @@ pi_enabled() {
   [ -n "${PI_CODING_AGENT_DIR:-}" ] || [ -d "$HOME/.pi" ]
 }
 
-# Everything Bun bundles into the stand-in, relative to the repo: its sources
-# under suspend/ (not tests), the build script, and the files under herdr/
-# that they import (the shared recipe module, which imports nothing itself).
+# Everything Bun bundles into the stand-in and the reporter, relative to the
+# repo: their sources under suspend/ (not tests), the build script, the files
+# under herdr/ that they import (recipes.js, resume-report.js,
+# claude-options.js), and the files those import from their own folder.
 standin_sources() {
   ts=$(files suspend | grep '\.ts$' | grep -v '\.test\.ts$' | grep -v '\.d\.ts$' | sed 's|^|suspend/|') || :
   [ -z "$ts" ] || printf '%s\n' "$ts"
   echo suspend/build.sh
-  [ -z "$ts" ] || printf '%s\n' "$ts" | while IFS= read -r rel; do
+  [ -n "$ts" ] || return 0
+  shared=$(printf '%s\n' "$ts" | while IFS= read -r rel; do
     [ ! -f "$repo/$rel" ] || sed -n "s|.*[\"']\.\./\(herdr/[^\"']*\)[\"'].*|\1|p" "$repo/$rel"
+  done | sort -u)
+  # Their imports in the same folder ("./x.js"), until no new file shows up.
+  while :; do
+    more=$(printf '%s\n' "$shared" | while IFS= read -r rel; do
+      [ -n "$rel" ] && [ -f "$repo/$rel" ] || continue
+      sed -n "s|.*from [\"']\./\([^\"'/]*\)[\"'].*|$(dirname "$rel")/\1|p" "$repo/$rel"
+    done | cat - /dev/null)
+    next=$(printf '%s\n%s\n' "$shared" "$more" | sed '/^$/d' | sort -u)
+    [ "$next" = "$shared" ] && break
+    shared=$next
   done
+  [ -z "$shared" ] || printf '%s\n' "$shared"
 }
 
 # One hash over the stand-in's source paths and contents. The stand-in is
@@ -165,11 +183,20 @@ standin_hash() {
 
 has_bun() { command -v bun >/dev/null 2>&1; }
 has_suspend_sources() { [ -f "$repo/suspend/main.ts" ] && [ -f "$repo/suspend/herdr-shell" ]; }
+# The reporter is built only when its entry point is in the repo.
+has_report_sources() { [ -f "$repo/suspend/report-main.ts" ]; }
+# Whether the build left every one of these files in $bin as name.install-tmp.
+staged() {
+  for name in "$@"; do [ -f "$bin/$name.install-tmp" ] || return 1; done
+}
 
-# The stand-in and herdr-shell, side by side in $bin (herdr-shell starts the
-# herdr-standin next to itself). Both are program files, not settings, so a
-# new version replaces them even when edited on this machine (no .orig). A failed build keeps the installed stand-in
-# and its record, so the next pass tries again; the rest of the install goes on.
+# The stand-in, the reporter and herdr-shell, side by side in $bin (herdr-shell
+# starts the herdr-standin next to itself; the Claude plugin's hook runs
+# herdr-agent-report from there). All are program files, not settings, so a
+# new version replaces them even when edited on this machine (no .orig). One
+# build makes both binaries, and both are recorded by the same source hash. A
+# failed build keeps the installed binaries and their records, so the next
+# pass tries again; the rest of the install goes on.
 install_suspend() (
   manifest="$state/installed-suspend"
   if ! has_bun; then echo 'suspend: skipped (no bun)'; return 0; fi
@@ -179,23 +206,37 @@ install_suspend() (
   : > "$next"
   changed=0
   want=$(standin_hash)
-  if [ -x "$bin/herdr-standin" ] && [ "$(last herdr-standin)" = "$want" ]; then
-    echo "$want herdr-standin" >> "$next"
-  elif (cd "$bin" && sh "$repo/suspend/build.sh" "$bin/herdr-standin.install-tmp") > "$build_log" 2>&1 &&
-    [ -f "$bin/herdr-standin.install-tmp" ]; then
-    chmod 755 "$bin/herdr-standin.install-tmp"
-    mv -f "$bin/herdr-standin.install-tmp" "$bin/herdr-standin"
-    echo "built      herdr-standin ($(head -n 1 "$build_log"))"
-    echo "$want herdr-standin" >> "$next"
-    changed=$((changed + 1))
+  outputs=herdr-standin
+  has_report_sources && outputs="herdr-standin herdr-agent-report"
+  current=true
+  set --
+  for name in $outputs; do
+    [ -x "$bin/$name" ] && [ "$(last "$name")" = "$want" ] || current=false
+    set -- "$@" "$bin/$name.install-tmp"
+  done
+  if $current; then
+    for name in $outputs; do echo "$want $name" >> "$next"; done
+  elif (cd "$bin" && sh "$repo/suspend/build.sh" "$@") > "$build_log" 2>&1 && staged $outputs; then
+    for name in $outputs; do
+      chmod 755 "$bin/$name.install-tmp"
+      mv -f "$bin/$name.install-tmp" "$bin/$name"
+      echo "$want $name" >> "$next"
+      changed=$((changed + 1))
+    done
+    echo "built      $(echo $outputs | sed 's/ / and /') ($(head -n 1 "$build_log"))"
+    # macOS checks a new binary on its first launch (1.8 s once). Take that
+    # delay here, not in Claude's first hook. With no agent it exits at once.
+    if [ -x "$bin/herdr-agent-report" ]; then "$bin/herdr-agent-report" < /dev/null > /dev/null 2>&1 || :; fi
   else
-    rm -f "$bin/herdr-standin.install-tmp"
+    for name in $outputs; do rm -f "$bin/$name.install-tmp"; done
     {
-      echo 'suspend: building herdr-standin failed; the installed copy, if any, is kept. Output:'
+      echo "suspend: building $(echo $outputs | sed 's/ / and /') failed; the installed copies, if any, are kept. Output:"
       sed 's/^/  /' "$build_log"
     } >&2
-    was=$(last herdr-standin)
-    [ -z "$was" ] || echo "$was herdr-standin" >> "$next"
+    for name in $outputs; do
+      was=$(last "$name")
+      [ -z "$was" ] || echo "$was $name" >> "$next"
+    done
   fi
   want=$(sha "$repo/suspend/herdr-shell")
   if [ ! -x "$bin/herdr-shell" ] || [ "$(last herdr-shell)" != "$want" ]; then
@@ -349,6 +390,39 @@ install_shell_key() {
   esac
 }
 
+# The Claude plugin herdr-resume, from this repo's marketplace (claude/), for
+# the user. Claude loads a folder marketplace in place, so an edit to the
+# plugin applies at Claude's next session without a reinstall: this runs once
+# per repo folder, recorded in installed-claude, and again with --force. Both
+# claude commands do nothing when it is already there. A failure is reported
+# and not recorded, so the next run tries again; it never stops the install.
+install_claude() (
+  manifest="$state/installed-claude"
+  plugin=herdr-resume@herdr-tincho-config
+  market="$repo/claude"
+  if [ ! -f "$market/.claude-plugin/marketplace.json" ]; then echo 'claude: skipped (no plugin sources)'; return 0; fi
+  if ! command -v claude >/dev/null 2>&1; then
+    echo "claude: skipped (no claude on PATH); install the plugin by hand:"
+    echo "        claude plugin marketplace add '$market' && claude plugin install $plugin --scope user"
+    return 0
+  fi
+  # Keyed by the plugin, with the hash of the repo folder it came from.
+  want=$(printf '%s' "$market" | sha -)
+  if ! $force && [ "$(last "$plugin")" = "$want" ]; then return 0; fi
+  mkdir -p "$state"
+  log="$state/claude-plugin.log"
+  if claude plugin marketplace add "$market" < /dev/null > "$log" 2>&1 &&
+    claude plugin install "$plugin" --scope user < /dev/null >> "$log" 2>&1; then
+    echo "$want $plugin" > "$manifest"
+    echo "installed  Claude plugin $plugin (from $market)"
+  else
+    {
+      echo "claude: installing the plugin $plugin failed; the next run tries again. Output:"
+      sed 's/^/  /' "$log"
+    } >&2
+  fi
+)
+
 install() {
   install_tree herdr "$app" "$state/installed"
   if pi_enabled; then
@@ -357,6 +431,7 @@ install() {
     echo 'pi: skipped (no existing ~/.pi directory; set PI_CODING_AGENT_DIR to opt in)'
   fi
   install_suspend
+  install_claude
 }
 
 # Hash paths and contents in enabled trees. Unlike an mtime comparison against

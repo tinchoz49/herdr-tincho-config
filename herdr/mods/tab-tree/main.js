@@ -18,8 +18,7 @@
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { spaces, panes, terminals, machines, run, openOverlay, theme, shared, setShared, exec, hc, home, layout } from "herdr";
-import { LABEL, RECIPES, WAKE_MS, createRecovery, remember, claudeLaunch, rememberClaudeLaunch, waking, frontProgram, holderInFront } from "./resume.js";
-import { claudeCandidate, processIdentity } from "./claude-polling.js";
+import { LABEL, WAKE_MS, createRecovery, recoverable, remember, waking, frontProgram, holderInFront } from "./resume.js";
 import { SUSPENDED, STANDIN_APP, suspension } from "./recipes.js";
 import { createSuspender } from "./suspend-policy.js";
 
@@ -106,13 +105,10 @@ export default class TabTree extends View {
     this.asking = new Set();
     this.labeling = new Set(); // `${address}=${agent}` labels on their way to the core
     this.labels = new Map(); // address -> its core labels, as of the last render
-    cx.timer.every(3000, (cx) => this.remember(cx));
-    this.sessionsBusy = false;
-    cx.timer.every(10000, (cx) => this.rememberSessions(cx));
     // One policy per copy; only the leading copy acts (several windows can
-    // show tab-tree at once). Focus and manual requests are observed in
-    // render; the 15 s pass is the only periodic work (it never overlaps
-    // itself).
+    // show tab-tree at once). Focus, manual requests and the last-agent labels
+    // are handled from render; the 15 s pass is the only periodic work (it
+    // never overlaps itself).
     this.suspender = createSuspender();
     cx.timer.every(15000, (cx) => cx.spawn(() => this.suspender.pass()));
     this.refresh(cx);
@@ -239,36 +235,6 @@ export default class TabTree extends View {
         await remember(p.terminal, agent).catch(() => null);
         this.labeling.delete(key);
       });
-    }
-  }
-
-  // Labels each local terminal running Claude with its session id (SESSION)
-  // and launch options (CLAUDE_OPTIONS), so recovery (↻) and a wake continue
-  // that exact conversation, started the same way. One pass at a time, terminals in turn.
-  rememberSessions(cx) {
-    if (this.sessionsBusy) return;
-    // Every core terminal, not panes(): sub-agents run in terminals no pane lists.
-    const todo = terminals().filter(claudeCandidate).map((t) => ({ address: t.address, identity: processIdentity(t) }));
-    if (!todo.length) return;
-    this.sessionsBusy = true;
-    try {
-      cx.spawn(async () => {
-        try {
-          for (const { address, identity } of todo) {
-            const current = () => terminals().find((t) => t.address === address && claudeCandidate(t) && processIdentity(t) === identity);
-            const before = current();
-            if (!before) continue;
-            const found = await claudeLaunch(address, before).catch(() => null);
-            const after = current();
-            if (found && after) await rememberClaudeLaunch(address, found, after.labels ?? {}).catch(() => null);
-          }
-        } finally {
-          this.sessionsBusy = false;
-        }
-      });
-    } catch (error) {
-      this.sessionsBusy = false;
-      throw error;
     }
   }
 
@@ -421,12 +387,13 @@ export default class TabTree extends View {
     const on = s.active && tab.active;
     const kidsOpen = root.kids.length > 0 && !this.folded.has(tab.id);
     const held = this.heldState(p);
-    // Back at a shell prompt: ↻ recovers the agent the terminal last ran. Never
+    // Back at a shell prompt: ↻ resumes the agent from its resume report, or
+    // opens the last agent's picker without one (spec Q1). Never
     // in a stand-in: it is the main program, so it looks like a shell. Nor
     // while the suspension label is set: recovery refuses to type then.
     const local = !held && d.k === "shell" && p.terminal && !p.terminal.includes("/") && !this.suspensionLabel(p.terminal);
-    const last = local ? this.labels.get(p.terminal)?.[LABEL] : null;
-    const agent = last && RECIPES[last] ? last : null;
+    const last = local ? this.labels.get(p.terminal)?.[LABEL] ?? null : null;
+    const agent = local ? recoverable(this.labels.get(p.terminal) ?? {}, { agent: last, cwd: p.cwd }) : null;
     const hovered = this.hovered === tab.id;
     if (collapsed) {
       return h_flex().id(`tab-${tab.id}`).h(28).flex_none().justify_center().items_center().gap(3).rounded(7)
@@ -476,7 +443,7 @@ export default class TabTree extends View {
         .on_click((_e, cx) => {
           cx.stop_propagation();
           const labels = this.labels.get(p.terminal) ?? {};
-          cx.spawn(async (cx) => { await this.recovery.recover(cx, p.terminal, agent, labels, tab.named ? tab.name : null); });
+          cx.spawn(async (cx) => { await this.recovery.recover(cx, p.terminal, { agent: last, labels, tab: tab.named ? tab.name : null, cwd: p.cwd ?? null }); });
         })
         .child("↻")))
       .when(hovered, (el) => el.child(div().id(`tab-close-${tab.id}`).flex_none().p(2).rounded(4).text_color(t.dim)
@@ -775,6 +742,7 @@ export default class TabTree extends View {
   render(cx) {
     this.watch(cx);
     this.observeSuspension(cx);
+    this.remember(cx);
     const t = theme();
     const collapsed = narrow();
     const now = this.now();

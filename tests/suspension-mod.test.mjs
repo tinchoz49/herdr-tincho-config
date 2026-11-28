@@ -62,7 +62,7 @@ test("the policy adds one 15 s timer to tab-tree; focus wakes nothing, a click o
   const view = new TabTree();
   const initCx = context();
   view.init({}, initCx);
-  assert.deepEqual(initCx.every.map(({ ms }) => ms), [3000, 10000, 15000]);
+  assert.deepEqual(initCx.every.map(({ ms }) => ms), [15000]);
   // Render observes; its task publishes, and arms no timer for the focused stand-in.
   const renderCx = context();
   view.observeSuspension(renderCx);

@@ -6,9 +6,10 @@
 // suspended agent whose row you click in the sidebar.
 
 import { settings, focused, panes, terminals, shared, setShared, readTextFile, exec, hc } from "herdr";
-import { SESSION, PI_RECOVERY, SUSPENDED, STANDIN_APP, piRecovery, suspension } from "./recipes.js";
-import { isClaude } from "./claude-polling.js";
-import { frontProgram, holderInFront, piSessionHeld, claudeTranscript } from "./resume.js";
+import { SUSPENDED, STANDIN_APP, suspension } from "./recipes.js";
+import { reportOf } from "./resume-report.js";
+import { isClaude } from "./claude-process.js";
+import { frontProgram, holderInFront, reportHeld } from "./resume.js";
 
 export const NEVER_SUSPEND = "herdr.never-suspend";
 
@@ -16,9 +17,6 @@ export const NEVER_SUSPEND = "herdr.never-suspend";
 // this machine's core.
 /** @param {string} address */
 const remote = (address) => address.includes("/");
-
-/** @param {unknown} s */
-const printable = (s) => typeof s === "string" && s.length > 0 && !/[\x00-\x1f\x7f]/.test(s);
 
 // The agent running now, from its own report (terminals() keeps it in report,
 // hc get in status), else from the program table. Never from the last-agent
@@ -31,26 +29,21 @@ function agentOf(t) {
   return /^pi$/i.test(key ?? "") ? "pi" : null;
 }
 
-// What makes each agent resumable, so a wake continues the same conversation
-// (never a picker). labeled: its session in the terminal's labels. onDisk:
-// that session on disk, read with a process (a slow rule): Claude's
-// transcript (a Claude that never got a prompt names a session without one),
-// or a Pi session file that holds the recorded session (Pi may write it only
-// after the first message). Without it the wake could not continue the
-// conversation, and its messages would be lost or blocked.
-/** @typedef {(labels: Record<string, string>) => boolean} LabelCheck */
-/** @type {Record<"claude" | "pi", { labeled: LabelCheck, onDisk: (labels: Record<string, string>) => Promise<boolean> }>} */
+// What makes an agent resumable, so a wake continues the same conversation
+// (never a picker), the same rule for every agent: labeled, its resume report
+// (resume-report.js) is on the terminal and comes from the agent running now;
+// onDisk, the report's proof holds its conversation, read with a process (a
+// slow rule: a session may reach the disk only after its first message).
+// Without both the wake could not continue the conversation, and its
+// messages would be lost or blocked. A legacy Claude report runs in the
+// folder Claude runs in, as the suspension record does.
 const RESUMABLE = {
-  claude: {
-    labeled: (labels) => printable(labels[SESSION]),
-    onDisk: (labels) => claudeTranscript(labels[SESSION]),
+  /** @param {Record<string, any>} terminal @param {string} agent */
+  report: (terminal, agent) => {
+    const report = reportOf(terminal.labels ?? {}, { agent, cwd: terminal.foreground?.cwd ?? null });
+    return report?.agent === agent ? report : null;
   },
-  pi: {
-    // An ID-only record (no session file) is refused by the stand-in's wake,
-    // so suspending it would only leave a blocked stand-in.
-    labeled: (labels) => Boolean(piRecovery(labels[PI_RECOVERY])?.sessionFile),
-    onDisk: (labels) => piSessionHeld(piRecovery(labels[PI_RECOVERY])),
-  },
+  onDisk: reportHeld,
 };
 
 // The terminals being looked at in this copy's window: the one with the
@@ -105,7 +98,8 @@ export async function unusedAgent(terminal, { now = Date.now(), focusedAt = null
   const labels = terminal.labels ?? {};
   if (Object.hasOwn(labels, SUSPENDED)) return { unused: false, reason: "suspended" };
   const agent = agentOf(terminal);
-  if (!agent || !RESUMABLE[agent].labeled(labels)) return { unused: false, reason: "not-resumable" };
+  const report = agent ? RESUMABLE.report(terminal, agent) : null;
+  if (!agent || !report) return { unused: false, reason: "not-resumable" };
   if (labels[NEVER_SUSPEND] === "1") return { unused: false, reason: "pinned" };
   if (focusedHere().has(terminal.address) || focusedTerminals?.has(terminal.address)) return { unused: false, reason: "focused" };
   const status = statusOf(terminal);
@@ -121,7 +115,7 @@ export async function unusedAgent(terminal, { now = Date.now(), focusedAt = null
     if (now - since < config.afterMinutes * MINUTE) return { unused: false, reason: "recent" };
   }
   if (skipSlowRules) return { unused: true, agent };
-  if (!await RESUMABLE[agent].onDisk(labels)) return { unused: false, reason: "not-resumable" };
+  if (!await RESUMABLE.onDisk(report)) return { unused: false, reason: "not-resumable" };
   snapshot.table = await processTable();
   snapshot.place = agentPlace(snapshot.table, terminal, agent);
   const allHelpers = onlyHelpers(snapshot.table, terminal.pid, snapshot.place.agentPid, config.helpers);
