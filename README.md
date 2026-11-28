@@ -434,8 +434,8 @@ Right-click an agent tab on this machine:
   starts again, the row shows "waking…". A stand-in that can't wake the
   agent shows "Needs you".
 - In the terminal: the agent's last screen (with `restore_screen`), then a
-  line like `💤 pi suspended at 14:05 · wakes on a message or when focused ·
-  Enter wakes it`.
+  line like `💤 pi suspended at 14:05 · wakes on a message or a click on its
+  row · Enter wakes it`.
 - For other agents, a suspended agent is an idle agent: `hc send --if idle`,
   `hc wait` and `hc send --wait` work as usual.
 
@@ -445,8 +445,12 @@ Right-click an agent tab on this machine:
   or a line you type in the stand-in and confirm with Enter. Messages that
   arrive within 500 ms of the first one go in together, as one first prompt.
   The stand-in never runs what it receives.
-- **Focus**: its tab stays focused for 1 second. Stepping past tabs with ⌘P
-  or the next-agent command wakes nothing.
+- **A click** on its tab or pane row in the sidebar.
+
+Focus alone never wakes an agent. Herdr moves the focus on its own (after a
+tab closes or an agent exits, into a new split, through ⌘P or the
+next-agent command), so a suspended tab that just got the focus stays
+suspended until you click its row or press Enter.
 - **Enter** on an empty line in the stand-in, also through `hc attach` from a
   plain terminal. The agent wakes with no prompt.
 
@@ -575,7 +579,6 @@ programs are installed and `herdr-shell` is hc's `shell`.
   and exits.
 - A 60 s heartbeat in Herdr's shared state keeps the leader choice. Every mod
   re-renders then.
-- One 1 s timer per focused suspended tab, cancelled when the focus moves.
 - About 15 ms per new terminal for `herdr-shell`'s label check.
 
 ### Known limits

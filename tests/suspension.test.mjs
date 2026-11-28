@@ -494,73 +494,38 @@ function suspendT7(report = { app: "herdr-standin", state: "idle" }) {
   terminalList = terminalList.map((t) => t.address === "t7" ? { ...listed(j), program: { key: "herdr-standin", agent: false, shell: false } } : t);
 }
 const presses = () => actions().filter(([, command]) => command === "keys");
-const live = () => timers.filter((t) => !t.cancelled && !t.fired);
 
-test("a suspended agent whose tab stays focused for 1 s gets one empty Enter in its stand-in, from one timer", async () => {
-  resetCopies();
-  suspendT7();
-  const a = copy("a");
-  await render(a, "one", NOW);
-  assert.deepEqual(timers, []);
-  windows.one = focusT7;
-  await render(a, "one", NOW + 250);
-  assert.deepEqual(timers.map((t) => t.ms), [1000]);
-  await render(a, "one", NOW + 500);
-  await elapse("one", NOW + 1249);
-  assert.deepEqual(presses(), []);
-  await elapse("one", NOW + 1250);
-  assert.deepEqual(presses(), [["hc", "keys", "t7", "enter"]]);
-  // Still focused: no second timer, no second Enter.
-  await render(a, "one", NOW + 1500);
-  await elapse("one", NOW + 5000);
-  assert.equal(timers.length, 1);
-  assert.deepEqual(presses(), [["hc", "keys", "t7", "enter"]]);
-});
-
-test("stepping past a suspended agent's tab wakes nothing: its timer is cancelled", async () => {
-  resetCopies();
-  suspendT7();
-  const a = copy("a");
-  await render(a, "one", NOW);
-  // ⌘P or the next-agent command moves through t7 and on.
-  windows.one = focusT7;
-  await render(a, "one", NOW + 250);
-  windows.one = { ...focusT7, tab: "tab-8", pane: "pane-8", terminal: "t8" };
-  await render(a, "one", NOW + 1000);
-  assert.deepEqual(timers.map((t) => t.cancelled), [true]);
-  await elapse("one", NOW + 3000);
-  assert.deepEqual(presses(), []);
-});
-
-test("a wake timer that fires after the focus moved, before any render, wakes nothing", async () => {
-  resetCopies();
-  suspendT7();
-  const a = copy("a");
-  await render(a, "one", NOW);
-  windows.one = focusT7;
-  await render(a, "one", NOW + 250);
-  windows.one = { ...focusT7, tab: "tab-1", pane: "pane-1", terminal: "t1" };
-  await elapse("one", NOW + 1250);
-  assert.deepEqual(presses(), []);
-});
-
-test("focus in another window wakes too, but only the leader arms a timer and presses Enter", async () => {
+test("focus never wakes a suspended agent: a focused tab, a close, a new pane, any window", async () => {
   resetCopies();
   suspendT7();
   const a = copy("a");
   const b = copy("b");
   await render(a, "one", NOW);
-  windows.two = focusT7;
   await render(b, "two", NOW);
-  assert.deepEqual(timers, []);
-  // b's entry re-renders every mod: the leader sees the focus.
+  // Selected, handed over by a closed tab, and focused in another window.
+  windows.one = focusT7;
   await render(a, "one", NOW + 10);
-  assert.deepEqual(timers.map((t) => t.ms), [990]);
-  await elapse("one", NOW + 1000);
+  paneList = paneList.filter((p) => p.tab !== "tab-1");
+  windows.two = focusT7;
+  await render(b, "two", NOW + 20);
+  await render(a, "one", NOW + 30);
+  // A stand-in moved into the focused tab (a split, a replaced pane).
+  windows.one = { ...focusT7, tab: "tab-8", pane: "pane-8", terminal: "t8" };
+  paneList = [...paneList, { pane: "pane-9", terminal: "t7", tab: "tab-8", focused: false }];
+  await render(a, "one", NOW + 40);
+  await elapse("one", NOW + 60_000);
+  assert.deepEqual([timers, presses()], [[], []]);
+});
+
+test("a click on a suspended agent's row presses one empty Enter in its stand-in", async () => {
+  resetCopies();
+  suspendT7();
+  const a = copy("a");
+  await a.wakeClicked(["t7", "t7"]);
   assert.deepEqual(presses(), [["hc", "keys", "t7", "enter"]]);
 });
 
-test("no Enter goes to a terminal that is not an idle stand-in, until its stand-in waits", async () => {
+test("a click wakes nothing that is not an idle stand-in, nor a remote terminal", async () => {
   for (const [name, setup] of [
     // The label is set, but the agent has not ended yet (between steps 4 and 5).
     ["agent still running", () => { core.t7 = [piCore({ labels: { ...piCore().labels, [SUSPENDED]: standinRecord } })]; terminalList = terminalList.map((t) => t.address === "t7" ? listed(core.t7[0]) : t); }],
@@ -570,33 +535,22 @@ test("no Enter goes to a terminal that is not an idle stand-in, until its stand-
   ]) {
     resetCopies();
     setup();
-    const a = copy("a");
-    windows.one = focusT7;
-    await render(a, "one", NOW);
-    await elapse("one", NOW + 2000);
-    assert.deepEqual([timers, presses()], [[], []], name);
+    await copy("a").wakeClicked(["t7", "t1", "t8"]);
+    assert.deepEqual(presses(), [], name);
   }
-  // The stand-in starts while the tab is focused: its idle report re-renders,
-  // and the Enter follows 1 s after the focus began.
   resetCopies();
-  const a = copy("a");
-  windows.one = focusT7;
-  await render(a, "one", NOW);
   suspendT7();
-  await render(a, "one", NOW + 3000);
-  assert.deepEqual(timers.map((t) => t.ms), [0]);
-  await elapse("one", NOW + 3000);
-  assert.deepEqual(presses(), [["hc", "keys", "t7", "enter"]]);
+  await copy("a").wakeClicked(["box/t7"]);
+  assert.deepEqual(presses(), []);
 });
 
-test("closing a copy cancels its wake timers", async () => {
+test("a closed copy wakes nothing on a click", async () => {
   resetCopies();
   suspendT7();
   const a = copy("a");
-  windows.one = focusT7;
-  await render(a, "one", NOW);
   a.close();
-  assert.deepEqual(timers.map((t) => t.cancelled), [true]);
+  await a.wakeClicked(["t7"]);
+  assert.deepEqual(presses(), []);
 });
 
 // Another mod (ticket 09's menu) asks for a manual suspension.

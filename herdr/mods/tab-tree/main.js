@@ -7,7 +7,7 @@
 // A suspended agent's tab shows a dimmed name and 💤, and "waking…" while its
 // stand-in wakes it; it never offers ↻.
 // It also runs the suspension policy (suspend-policy.js): unused agents are
-// suspended, and a suspended agent wakes when its tab stays focused for 1 s.
+// suspended, and a suspended agent wakes when you click its row (not on focus).
 // Drag a group's header above or below another group to reorder the spaces.
 // Drag a tab between two rows to reorder it, or into another space to move it
 // there, programs still running. A ghost of the row follows the pointer and a
@@ -124,11 +124,10 @@ export default class TabTree extends View {
   }
 
   // From render: the policy records the focus and the manual requests; what
-  // it must do about them (publish, wake timers, requests) starts outside
-  // render, in a task, with that task's timers.
+  // it must do about them (publish, requests) starts outside render, in a task.
   observeSuspension(cx) {
     if (!this.suspender.observe()) return;
-    cx.spawn((cx) => this.suspender.act({ schedule: (ms, run) => cx.timer.after(ms, (cx) => cx.spawn(run)) }));
+    cx.spawn(() => this.suspender.act());
   }
 
   // A terminal's tag (its `tag` label) as a small chip, or nothing.
@@ -432,7 +431,7 @@ export default class TabTree extends View {
     if (collapsed) {
       return h_flex().id(`tab-${tab.id}`).h(28).flex_none().justify_center().items_center().gap(3).rounded(7)
         .when(on, (el) => el.bg(t.selected)).hover((el) => el.bg(t.hover))
-        .on_click(() => run("tab.select", { id: tab.id }))
+        .on_click(() => { run("tab.select", { id: tab.id }); this.wakeTab(tab.id); })
         .child(this.glyph(t, p, d.k, 15, held === "suspended"))
         .child(this.heldStatus(t, p, held, tab.status, true));
     }
@@ -457,7 +456,7 @@ export default class TabTree extends View {
         this.press = { kind: "tab", tab, root, s, machine: s.machine ?? null, name, k: d.k, x: e.position.x, y: e.position.y };
         this.dragged = false;
       })
-      .on_click(() => { if (!this.dragged) run("tab.select", { id: tab.id }); })
+      .on_click(() => { if (!this.dragged) { run("tab.select", { id: tab.id }); this.wakeTab(tab.id); } })
       .on_mouse_down("right", () => openOverlay({ mod: "tab-menu", kind: "popup", width: 220, height: 270, props: { tab: "tab", target: { id: tab.id, space: s.id, terminal: p.terminal } } }))
       .child(div().id(`tab-fold-${tab.id}`).w(12).flex_none().text_color(t.dim)
         .when(root.kids.length > 0, (el) => el.hover((el) => el.text_color(t.foreground))
@@ -489,6 +488,12 @@ export default class TabTree extends View {
       .when(!hovered, (el) => el.child(this.heldStatus(t, p, held, p.status)));
   }
 
+  // A click on a tab row wakes the suspended agents in that tab (focus alone
+  // never does: see suspend-policy.js).
+  wakeTab(id) {
+    return this.suspender.wakeClicked(panes().filter((x) => x.tab === id).map((x) => x.terminal));
+  }
+
   count(n) {
     return 1 + n.kids.reduce((sum, k) => sum + this.count(k), 0);
   }
@@ -518,7 +523,7 @@ export default class TabTree extends View {
       .cursor_pointer()
       .when(p.focused, (el) => el.bg(t.raised))
       .hover((el) => el.bg(t.hover))
-      .on_click(() => run("pane.focus", { pane: p.pane }))
+      .on_click(() => { run("pane.focus", { pane: p.pane }); if (p.terminal) this.suspender.wakeClicked([p.terminal]); })
       .on_mouse_down("right", () => openOverlay({ mod: "tab-menu", kind: "popup", width: 240, height: 300, props: { tab: "pane", target: { pane: p.pane, terminal: p.terminal } } }))
       .children(lines.map((l) => div().self_start().mt(-4).w(9).h(17).mr(4).flex_none()
         .when(Boolean(l), (el) => el.border_l(1.5).border_color(t.input))

@@ -2,8 +2,8 @@
 // the tab-tree mod. The eligibility rules say which agents are unused agents;
 // each rule that fails gives its own reason, so "Suspend now" can say what to
 // change. createSuspender() runs the rules on a timer: one copy of the mod
-// leads, suspends unused agents in ordered steps, and wakes a suspended agent
-// whose tab stays focused.
+// leads and suspends unused agents in ordered steps. wakeClicked() wakes a
+// suspended agent whose row you click in the sidebar.
 
 import { settings, focused, panes, terminals, shared, setShared, readTextFile, exec, hc } from "herdr";
 import { SESSION, PI_RECOVERY, SUSPENDED, STANDIN_APP, piRecovery, suspension } from "./recipes.js";
@@ -354,9 +354,10 @@ const STALE_MS = 150_000;
 // the threshold is longer).
 const SEEN_MS = 24 * 60 * MINUTE;
 
-// A suspended agent wakes when its tab stays focused this long. Stepping past
-// tabs (⌘P, the next-agent command) moves on sooner and wakes nothing.
-const WAKE_FOCUS_MS = 1_000;
+// Focus never wakes a suspended agent: Herdr moves the focus on its own (a
+// closed tab, a new split, a pane that replaces an ended one). It wakes on a
+// click on its row in the sidebar (wakeClicked), Enter in its stand-in, or a
+// message.
 
 // A stand-in that waits for a message: the suspension label, and an idle
 // report from the stand-in itself (not "working" while it wakes the agent,
@@ -455,17 +456,14 @@ const terminalAt = (address) => terminals().find((t) => t?.address === address);
 /** @param {Record<string, any>} t */
 const localAgent = (t) => typeof t?.address === "string" && !remote(t.address) && Boolean(t.program?.agent || t.report);
 
-/** @typedef {(ms: number, run: () => unknown) => { cancel(): void }} Schedule */
-
 /**
  * One copy of the policy, for one copy of the mod. No timer of its own runs
  * more often than the pass:
  * - observe(), from render: reads this window's focus, the other copies'
  *   entries and the manual requests. It changes nothing outside this copy and
  *   returns true when act() has work.
- * - act({ schedule }), outside render (cx.spawn): publishes this copy's
- *   entry, and the leader arms or cancels wake timers (one 1 s timer per
- *   focused suspended agent) and handles manual requests.
+ * - act(), outside render (cx.spawn): publishes this copy's entry, and the
+ *   leader handles manual requests.
  * - pass(), every 15 s: the heartbeat, and the leader's shared reasons and
  *   automatic suspension. It reads no process when no agent qualifies.
  * @param {{ id?: string, clock?: () => number }} [options]
@@ -482,8 +480,6 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
   let passing = false;
   /** @type {Set<string>} */
   const requesting = new Set(); // terminals whose request this copy is handling
-  /** @type {Map<string, { since: number, timer: { cancel(): void } | null }>} */
-  const wakes = new Map(); // focused suspended terminal -> its focus's wake timer (null once fired)
   /** @type {boolean | null} */
   let installed = null; // from the last installed check (null before one)
   let installedAt = -Infinity;
@@ -566,17 +562,6 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
   /** @param {ReturnType<typeof focusView>} view @param {string} address */
   const rulesInput = (view, address) => ({ focusedAt: view.last.get(address) ?? null, focusedTerminals: new Set(view.focused.keys()) });
 
-  // The focused suspended agents to wake: address -> since when focused.
-  /** @param {number} now */
-  function wakeTargets(now) {
-    /** @type {Map<string, number>} */
-    const targets = new Map();
-    const { focused } = focusView(now);
-    if (!focused.size) return targets;
-    for (const [address, at] of focused) if (!remote(address) && idleStandin(terminalAt(address))) targets.set(address, at);
-    return targets;
-  }
-
   // The requests in SUSPEND_REQUESTS that wait for this copy: [address, requested].
   /** @param {number} now @returns {[string, number][]} */
   function newRequests(now) {
@@ -595,28 +580,10 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
     if (track(now)) focusChanged = true;
     // Another copy's write dropped this copy's entry: write it again.
     if (published > -Infinity && !Object.hasOwn(windowEntries(), id)) focusChanged = true;
-    let work = focusChanged;
-    if (!work && leading(now)) {
-      const targets = wakeTargets(now);
-      work = [...targets].some(([address, at]) => wakes.get(address)?.since !== at) ||
-        [...wakes.keys()].some((address) => !targets.has(address)) || newRequests(now).length > 0;
-    } else if (!work) {
-      work = wakes.size > 0;
-    }
+    const work = focusChanged || (leading(now) && newRequests(now).length > 0);
     if (!work || due) return false;
     due = true;
     return true;
-  }
-
-  // The leader presses an empty Enter in the stand-in of a suspended agent
-  // whose tab is still focused since the same time, in any window.
-  /** @param {string} address @param {number} at */
-  async function wakeIfStillFocused(address, at) {
-    const now = clock();
-    // The focus as it is now, also when no render followed its last change.
-    if (track(now)) focusChanged = true;
-    if (!leading(now) || wakeTargets(now).get(address) !== at) return;
-    await hc(["keys", address, "enter"]).catch(() => /** @type {null} */ (null));
   }
 
   /** @param {(state: SuspendState) => Partial<SuspendState>} change @param {number} now */
@@ -676,31 +643,24 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
     if (!closed) share(address, "repair", { suspended: false, reason: removed ? "repaired" : "failed" }, now);
   }
 
-  // The work observe() found, outside render. schedule(ms, run) starts a
-  // one-shot timer (cx.timer.after) and returns it.
-  /** @param {{ now?: number, schedule: Schedule }} options */
-  async function act({ now = clock(), schedule }) {
+  // The work observe() found, outside render.
+  /** @param {{ now?: number }} [options] */
+  async function act({ now = clock() } = {}) {
     due = false;
     if (closed) return;
     if (focusChanged) publish(now);
-    const lead = leading(now);
-    const targets = lead ? wakeTargets(now) : new Map();
-    // One timer per focus of a suspended agent: cancelled when the focus moves.
-    for (const [address, wake] of wakes) {
-      if (targets.get(address) === wake.since) continue;
-      wake.timer?.cancel();
-      wakes.delete(address);
-    }
-    for (const [address, at] of targets) {
-      if (wakes.has(address)) continue;
-      const wake = { since: at, timer: /** @type {{ cancel(): void } | null} */ (null) };
-      wakes.set(address, wake);
-      wake.timer = schedule(Math.max(0, at + WAKE_FOCUS_MS - now), () => {
-        wake.timer = null;
-        return wakeIfStillFocused(address, at);
-      });
-    }
-    if (lead) await handleRequests(now);
+    if (leading(now)) await handleRequests(now);
+  }
+
+  // A click on a row in the sidebar: an empty Enter in each idle stand-in among
+  // these terminals wakes its agent. Only a click wakes; focus never does.
+  /** @param {string[]} addresses */
+  async function wakeClicked(addresses) {
+    if (closed) return;
+    await Promise.all([...new Set(addresses)].map((address) => {
+      if (typeof address !== "string" || remote(address) || !idleStandin(terminalAt(address))) return null;
+      return hc(["keys", address, "enter"]).catch(() => /** @type {null} */ (null));
+    }));
   }
 
   // The ordered suspension steps. Any failed check aborts, and nothing more
@@ -851,13 +811,11 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
     pass,
     leading,
     suspend,
-    // Cancels the wake timers and removes this copy's entry, so another copy
-    // leads at once.
+    wakeClicked,
+    // Removes this copy's entry, so another copy leads at once.
     close() {
       if (closed) return;
       closed = true;
-      for (const wake of wakes.values()) wake.timer?.cancel();
-      wakes.clear();
       const entries = windowEntries();
       if (!Object.hasOwn(entries, id)) return;
       delete entries[id];

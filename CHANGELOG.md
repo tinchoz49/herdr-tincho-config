@@ -44,12 +44,14 @@ consolidated below.
 - Suspension of unused agents: idle Claude and Pi agents are ended to free
   memory while their terminals keep their address, labels and links. A
   stand-in holds each suspended terminal and wakes the agent from its session
-  when a message arrives, when its tab stays focused for one second, or on
-  Enter; the messages become the first prompt. Configurable with
+  when a message arrives, when you click its row in the sidebar, or on
+  Enter; focus alone never wakes it, since Herdr moves the focus on its own.
+  The messages become the first prompt. Configurable with
   `tincho.suspend` (`after_minutes`, `helpers`; `false` or `0` turns automatic
   suspension off). An agent that hc started directly gets `SIGKILL`, then its
   helper processes `SIGTERM` (Pi turns `SIGTERM` into a normal exit, which
-  would end the terminal); a shell that hosts an agent gets `SIGTERM`. Claude
+  would end the terminal); a shell that hosts an agent (fish, bash or zsh)
+  gets `SIGKILL` too, and the agent in front then gets `SIGHUP`. Claude
   counts as resumable only with its transcript on disk, Pi only with a
   session file that holds its session; otherwise the agent isn't suspended.
   A wake that finds the session gone keeps the messages in an `undelivered`

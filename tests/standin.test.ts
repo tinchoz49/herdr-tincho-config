@@ -116,7 +116,7 @@ describe("start", () => {
     expect(t.steps).toContain("hc get t7 --json");
     expect(t.steps).toContain("raw true");
     expect(t.screen()).toContain("\x1b[?2004h");
-    expect(t.screen()).toContain("💤 pi suspended at 14:05 · wakes on a message or when focused · Enter wakes it");
+    expect(t.screen()).toContain("💤 pi suspended at 14:05 · wakes on a message or a click on its row · Enter wakes it");
     expect(t.screen().endsWith(report("idle"))).toBe(true);
     expect(t.execs).toEqual([]);
   });

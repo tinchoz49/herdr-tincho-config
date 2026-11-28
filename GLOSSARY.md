@@ -32,7 +32,7 @@ _Avoid_: Freeze, pause, discard, sleep, hibernate
 A resumable agent whose process was ended by suspension; its terminal keeps its address, labels and links, so messages can still reach it.
 
 **Wake**:
-To start a suspended agent again from its session, because a message arrived or its tab was focused.
+To start a suspended agent again from its session, because a message arrived, you clicked its row in the sidebar, or you pressed Enter in its stand-in. Focus alone never wakes it.
 _Avoid_: Resume, recover, restore
 
 **Recovery**:

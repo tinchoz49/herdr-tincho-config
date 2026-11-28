@@ -239,7 +239,7 @@ export async function standin(args: string[], sys: System): Promise<void> {
   sys.raw(true);
   sys.listen((chunk) => { input.feed(chunk); maybeWake(); });
   sys.write("\x1b[?2004h");
-  sys.write(`\r\n💤 ${agent} suspended at ${record ? clock(record.since) : "--:--"} · wakes on a message or when focused · Enter wakes it\r\n`);
+  sys.write(`\r\n💤 ${agent} suspended at ${record ? clock(record.since) : "--:--"} · wakes on a message or a click on its row · Enter wakes it\r\n`);
   if ("cannotWake" in suspended) {
     // Blocked, so hc refuses sends and tells the parent; typed messages are kept in files.
     sys.write(`💤 ${agent} cannot wake: ${suspended.cannotWake}. Typed messages are kept in files.\r\n`);
